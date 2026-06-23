@@ -15,16 +15,16 @@ use tokio::sync::mpsc;
 use tun_rs::DeviceBuilder;
 use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MagicConfig {
-    pub(crate) handshake_init: u8,
-    pub(crate) handshake_resp: u8,
-    pub(crate) data: u8,
-    pub(crate) probe: u8,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MagicConfig {
+    pub handshake_init: u8,
+    pub handshake_resp: u8,
+    pub data: u8,
+    pub probe: u8,
 }
 
 impl MagicConfig {
-    pub(crate) fn default() -> Self {
+    pub fn default() -> Self {
         Self {
             handshake_init: 0x01,
             handshake_resp: 0x02,
@@ -32,6 +32,25 @@ impl MagicConfig {
             probe: 0x04,
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PeerStatus {
+    pub pubkey: String,
+    pub endpoint: Option<String>,
+    pub allowed_ips: Vec<String>,
+    pub last_rx_secs_ago: Option<u64>,
+    pub last_tx_secs_ago: Option<u64>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonStatus {
+    pub connection_state: String,
+    pub assigned_ip: Option<String>,
+    pub total_uploaded: u64,
+    pub total_downloaded: u64,
+    pub peers: Vec<PeerStatus>,
 }
 
 
@@ -161,6 +180,7 @@ struct ActiveSession {
     tx_nonce: u64,
     established_at: Instant,
     tx_bytes: u64,
+    rx_bytes: u64,
     replay: ReplayWindow,
 }
 
@@ -320,6 +340,7 @@ impl Peer {
                                         tx_nonce: 0,
                                         established_at: Instant::now(),
                                         tx_bytes: 0,
+                                        rx_bytes: 0,
                                         replay: ReplayWindow::new(),
                                     });
                                     self.last_rx = Instant::now();
@@ -378,9 +399,10 @@ impl Peer {
 
                         self.active = Some(ActiveSession {
                             state: stateless_transport,
-                            tx_nonce: 0,
+                            tx_nonce: 0,                            
                             established_at: Instant::now(),
                             tx_bytes: 0,
+                            rx_bytes: 0,
                             replay: ReplayWindow::new(),
                         });
 
@@ -460,6 +482,7 @@ impl Peer {
                 tracing::debug!("Dropping replayed/too-old packet, nonce {}", nonce);
                 return None;
             }
+            active.rx_bytes += payload.len() as u64;
             plaintext.truncate(len);
             if !plaintext.is_empty() {
                 if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
@@ -480,6 +503,7 @@ impl Peer {
                 tracing::debug!("Dropping replayed/too-old packet, nonce {} (previous session)", nonce);
                 return None;
             }
+            prev.rx_bytes += payload.len() as u64;
             plaintext.truncate(len);
             if !plaintext.is_empty() {
                 if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
@@ -604,6 +628,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Startup::Run(s) => s,
     };
 
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    run_with_settings(settings, shutdown_rx, None).await
+}
+
+pub async fn run_with_settings(
+    settings: crate::config::DaemonSettings,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    status_tx: Option<tokio::sync::mpsc::Sender<DaemonStatus>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let local_priv = hex::decode(&settings.private_key_hex).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -762,15 +795,61 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Handshake retransmission, keepalive, key rotation timer
     let session_timer = pm.clone();
     let sock_timer = sock.clone();
+    let status_tx_timer = status_tx.clone();
+    let tun_ip_timer = tun_ip.clone();
     let timer_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
 
             let mut actions = Vec::new();
+            let mut status_to_send = None;
             {
                 let mut manager = session_timer.lock().unwrap();
                 let local_priv = manager.local_priv.clone();
+
+                if status_tx_timer.is_some() {
+                    let mut peer_statuses = Vec::new();
+                    let mut total_uploaded = 0u64;
+                    let mut total_downloaded = 0u64;
+
+                    for peer in &manager.peers {
+                        let is_active = peer.active.is_some();
+                        let tx_bytes = peer.active.as_ref().map_or(0, |s| s.tx_bytes)
+                            + peer.previous.as_ref().map_or(0, |s| s.tx_bytes);
+                        let rx_bytes = peer.active.as_ref().map_or(0, |s| s.rx_bytes)
+                            + peer.previous.as_ref().map_or(0, |s| s.rx_bytes);
+
+                        total_uploaded += tx_bytes;
+                        total_downloaded += rx_bytes;
+
+                        let last_rx_secs_ago = peer.active.as_ref().map(|s| s.established_at.elapsed().as_secs());
+                        let last_tx_secs_ago = peer.active.as_ref().map(|s| s.established_at.elapsed().as_secs());
+
+                        peer_statuses.push(PeerStatus {
+                            pubkey: hex::encode(&peer.pubkey),
+                            endpoint: peer.endpoint.map(|e| e.to_string()),
+                            allowed_ips: peer.allowed_ips.iter().map(|s| s.to_string()).collect(),
+                            last_rx_secs_ago,
+                            last_tx_secs_ago,
+                            is_active,
+                        });
+                    }
+
+                    let connection_state = if manager.peers.iter().any(|p| p.active.is_some()) {
+                        "Connected".to_string()
+                    } else {
+                        "Connecting".to_string()
+                    };
+
+                    status_to_send = Some(DaemonStatus {
+                        connection_state,
+                        assigned_ip: Some(tun_ip_timer.clone()),
+                        total_uploaded,
+                        total_downloaded,
+                        peers: peer_statuses,
+                    });
+                }
 
                 for peer in manager.peers.iter_mut() {
                     // 1. Check rotation
@@ -832,6 +911,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                }
+            }
+
+            if let Some(status) = status_to_send {
+                if let Some(ref tx) = status_tx_timer {
+                    let _ = tx.send(status).await;
                 }
             }
 
@@ -994,6 +1079,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                     tx_nonce: 0,
                                                     established_at: Instant::now(),
                                                     tx_bytes: 0,
+                                                    rx_bytes: 0,
                                                     replay: ReplayWindow::new(),
                                                 });
                                                 peer.last_rx = Instant::now();
@@ -1257,6 +1343,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         res = relay_task => {
             tracing::info!("Relay task finished: {:?}", res);
         }
+        _ = &mut shutdown_rx => {
+            tracing::info!("Shutdown signal received; stopping daemon tasks");
+        }
     }
 
     Ok(())
@@ -1309,6 +1398,7 @@ async fn process_relayed_packet(
                                     tx_nonce: 0,
                                     established_at: Instant::now(),
                                     tx_bytes: 0,
+                                    rx_bytes: 0,
                                     replay: ReplayWindow::new(),
                                 });
                                 peer.last_rx = Instant::now();
@@ -1730,6 +1820,7 @@ mod tests {
             tx_nonce: 0,
             established_at: Instant::now(),
             tx_bytes: 0,
+            rx_bytes: 0,
             replay: ReplayWindow::new(),
         }
     }

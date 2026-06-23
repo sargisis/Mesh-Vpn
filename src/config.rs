@@ -170,22 +170,22 @@ fn default_local_udp() -> String {
 
 /// Effective daemon settings after merging the config file or CLI flags into
 /// one shape. Peers are kept as CLI-style specs and parsed downstream.
-pub(crate) struct DaemonSettings {
-    pub(crate) tun_name: String,
-    pub(crate) tun_ip: Option<String>,
-    pub(crate) tun_netmask: String,
-    pub(crate) local_udp: SocketAddr,
-    pub(crate) private_key_hex: String,
-    pub(crate) peer_specs: Vec<String>,
-    pub(crate) coordinator_url: Option<String>,
-    pub(crate) relay_addr: Option<String>,
-    pub(crate) auth_key: Option<String>,
-    pub(crate) hostname: Option<String>,
-    pub(crate) public_endpoint: Option<String>,
-    pub(crate) magic_handshake_init: u8,
-    pub(crate) magic_handshake_resp: u8,
-    pub(crate) magic_data: u8,
-    pub(crate) magic_probe: u8,
+pub struct DaemonSettings {
+    pub tun_name: String,
+    pub tun_ip: Option<String>,
+    pub tun_netmask: String,
+    pub local_udp: SocketAddr,
+    pub private_key_hex: String,
+    pub peer_specs: Vec<String>,
+    pub coordinator_url: Option<String>,
+    pub relay_addr: Option<String>,
+    pub auth_key: Option<String>,
+    pub hostname: Option<String>,
+    pub public_endpoint: Option<String>,
+    pub magic_handshake_init: u8,
+    pub magic_handshake_resp: u8,
+    pub magic_data: u8,
+    pub magic_probe: u8,
 }
 
 /// Resolve settings from `--config <file>` if given, otherwise from the CLI
