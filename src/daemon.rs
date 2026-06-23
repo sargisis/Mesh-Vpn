@@ -1,6 +1,7 @@
 //! AraxMesh data-plane daemon: peer/session state and the runtime loop.
 
 use crate::config::{Startup, parse_peer_arg, parse_startup};
+use crate::control::{PollRequest, PollResponse, RegisterRequest, RegisterResponse};
 use crate::packet::parse_ipv4_header;
 use crate::types::PeerDescriptor;
 use snow::{Builder, HandshakeState, StatelessTransportState};
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
 use tun_rs::DeviceBuilder;
+
 
 struct ActiveSession {
     state: StatelessTransportState,
@@ -380,25 +382,79 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let mut peers = Vec::new();
-    for p_str in &settings.peer_specs {
-        let parsed = parse_peer_arg(p_str)?;
-        peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
-    }
+    let mut secret_bytes = [0u8; 32];
+    secret_bytes.copy_from_slice(&local_priv);
+    let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    let pubkey_bytes = public.to_bytes();
+    let pubkey_hex = hex::encode(pubkey_bytes);
 
-    if peers.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "At least one peer must be configured (via --peer or [[peer]] in --config)",
-        )
-        .into());
-    }
+    let public_endpoint = if let Some(ep) = &settings.public_endpoint {
+        ep.clone()
+    } else {
+        settings.local_udp.to_string()
+    };
 
-    tracing::info!("Starting AraxMesh Phase 2 daemon");
+    let (tun_ip, peers) = if let Some(coord_url) = &settings.coordinator_url {
+        let http_client = reqwest::Client::new();
+        let reg_url = format!("{}/register", coord_url.trim_end_matches('/'));
+        let reg_req = RegisterRequest {
+            public_key: pubkey_hex.clone(),
+            auth_key: settings.auth_key.clone().unwrap_or_default(),
+            endpoint: public_endpoint.clone(),
+            hostname: settings.hostname.clone(),
+        };
+
+        tracing::info!("Registering with coordinator at {}...", reg_url);
+        let reg_resp: RegisterResponse = http_client
+            .post(&reg_url)
+            .json(&reg_req)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Registration failed: {}", e)))?
+            .json()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid registration response: {}", e)))?;
+
+        tracing::info!("Successfully registered. Assigned IP: {}", reg_resp.assigned_ip);
+
+        let mut parsed_peers = Vec::new();
+        for p_desc in reg_resp.peers {
+            match parse_peer_arg(&p_desc.to_spec()) {
+                Ok(parsed) => {
+                    parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse peer from coordinator: {}", e);
+                }
+            }
+        }
+        (reg_resp.assigned_ip, parsed_peers)
+    } else {
+        let mut parsed_peers = Vec::new();
+        for p_str in &settings.peer_specs {
+            let parsed = parse_peer_arg(p_str)?;
+            parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
+        }
+
+        if parsed_peers.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "At least one peer must be configured (via --peer or [[peer]] in --config)",
+            )
+            .into());
+        }
+        let static_tun_ip = settings.tun_ip.clone().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing tun_ip")
+        })?;
+        (static_tun_ip, parsed_peers)
+    };
+
+    tracing::info!("Starting AraxMesh Phase 3 daemon");
     tracing::info!(
         "TUN Interface: {} (IP: {}, Netmask: {})",
         settings.tun_name,
-        settings.tun_ip,
+        tun_ip,
         settings.tun_netmask
     );
     tracing::info!("Local UDP Bind: {}", settings.local_udp);
@@ -416,7 +472,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dev = DeviceBuilder::new()
         .name(&settings.tun_name)
         .mtu(1411) // 1420 - 9 bytes AraxMesh overhead (1 byte type + 8 bytes nonce)
-        .ipv4(settings.tun_ip.clone(), settings.tun_netmask.clone(), None)
+        .ipv4(tun_ip.clone(), settings.tun_netmask.clone(), None)
         .build_async()?;
 
     tracing::info!("Successfully created TUN interface: {}", dev.name()?);
@@ -742,6 +798,49 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let poll_task = if settings.coordinator_url.is_some() {
+        let coordinator_url = settings.coordinator_url.clone();
+        let auth_key = settings.auth_key.clone().unwrap_or_default();
+        let http_client = reqwest::Client::new();
+        let pm_poll = pm.clone();
+        let pubkey_hex = pubkey_hex.clone();
+        let public_endpoint = public_endpoint.clone();
+        tokio::spawn(async move {
+            let coord_url = coordinator_url.unwrap();
+            let poll_url = format!("{}/poll", coord_url.trim_end_matches('/'));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+
+                let poll_req = PollRequest {
+                    public_key: pubkey_hex.clone(),
+                    auth_key: auth_key.clone(),
+                    endpoint: public_endpoint.clone(),
+                };
+
+                match http_client.post(&poll_url).json(&poll_req).send().await {
+                    Ok(resp) => {
+                        match resp.json::<PollResponse>().await {
+                            Ok(poll_resp) => {
+                                tracing::debug!("Successfully polled coordinator. Reconciling {} peers.", poll_resp.peers.len());
+                                let mut manager = pm_poll.lock().unwrap();
+                                manager.sync_peers(&poll_resp.peers);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse poll response: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to poll coordinator: {:?}", e);
+                    }
+                }
+            }
+        })
+    } else {
+        tokio::spawn(std::future::pending::<()>())
+    };
+
     tokio::select! {
         res = tun_to_udp_task => {
             tracing::info!("TUN-to-UDP task finished: {:?}", res);
@@ -751,6 +850,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         res = timer_task => {
             tracing::info!("Timer task finished: {:?}", res);
+        }
+        res = poll_task => {
+            tracing::info!("Coordinator poll task finished: {:?}", res);
         }
     }
 
@@ -817,4 +919,101 @@ mod tests {
         assert_eq!(pm.peers.len(), 1);
         assert_eq!(pm.peers[0].pubkey, vec![0xaa; 32]);
     }
+
+    #[tokio::test]
+    async fn test_coordinator_registration_and_polling() {
+        use axum::{routing::post, Router, Json, extract::State};
+        use std::sync::{Arc, Mutex};
+        use crate::coordinator::Registry;
+        use crate::control::{RegisterRequest, RegisterResponse, PollRequest, PollResponse};
+
+        let registry = Registry::new("10.0.99.0/24").unwrap();
+        let state = Arc::new(Mutex::new(registry));
+
+        let app = Router::new()
+            .route("/register", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<RegisterRequest>| async move {
+                let mut reg = state.lock().unwrap();
+                let assigned_ip = reg.register(&req.public_key, req.endpoint, req.hostname).unwrap();
+                let peers = reg.peers_for(&req.public_key);
+                Json(RegisterResponse { assigned_ip, peers })
+            }))
+            .route("/poll", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<PollRequest>| async move {
+                let mut reg = state.lock().unwrap();
+                reg.poll(&req.public_key, req.endpoint).unwrap();
+                let peers = reg.peers_for(&req.public_key);
+                Json(PollResponse { peers })
+            }))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{}", local_addr);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. Register Node A
+        let reg_req_a = RegisterRequest {
+            public_key: "aa".repeat(32),
+            auth_key: "secret".to_string(),
+            endpoint: "1.1.1.1:50000".to_string(),
+            hostname: Some("node-a".to_string()),
+        };
+        let resp_a: RegisterResponse = client
+            .post(format!("{}/register", server_url))
+            .json(&reg_req_a)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(resp_a.assigned_ip, "10.0.99.1");
+        assert!(resp_a.peers.is_empty());
+
+        // 2. Register Node B
+        let reg_req_b = RegisterRequest {
+            public_key: "bb".repeat(32),
+            auth_key: "secret".to_string(),
+            endpoint: "2.2.2.2:50000".to_string(),
+            hostname: Some("node-b".to_string()),
+        };
+        let resp_b: RegisterResponse = client
+            .post(format!("{}/register", server_url))
+            .json(&reg_req_b)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(resp_b.assigned_ip, "10.0.99.2");
+        assert_eq!(resp_b.peers.len(), 1);
+        assert_eq!(resp_b.peers[0].public_key, "aa".repeat(32));
+
+        // 3. Poll Node A - should now see Node B
+        let poll_req_a = PollRequest {
+            public_key: "aa".repeat(32),
+            auth_key: "secret".to_string(),
+            endpoint: "1.1.1.1:50000".to_string(),
+        };
+        let poll_resp_a: PollResponse = client
+            .post(format!("{}/poll", server_url))
+            .json(&poll_req_a)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(poll_resp_a.peers.len(), 1);
+        assert_eq!(poll_resp_a.peers[0].public_key, "bb".repeat(32));
+    }
 }
+
