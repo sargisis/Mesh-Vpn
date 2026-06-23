@@ -202,10 +202,10 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
 
         let relay_addr = cfg.relay_addr.or_else(|| {
             cfg.coordinator_url.as_ref().and_then(|url_str| {
-                if let Ok(url) = reqwest::Url::parse(url_str) {
-                    if let Some(host) = url.host_str() {
-                        return Some(format!("{}:51821", host));
-                    }
+                if let Ok(url) = reqwest::Url::parse(url_str)
+                    && let Some(host) = url.host_str()
+                {
+                    return Some(format!("{}:51821", host));
                 }
                 None
             })
@@ -244,10 +244,10 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
 
         let relay_addr = args.relay_addr.clone().or_else(|| {
             args.coordinator_url.as_ref().and_then(|url_str| {
-                if let Ok(url) = reqwest::Url::parse(url_str) {
-                    if let Some(host) = url.host_str() {
-                        return Some(format!("{}:51821", host));
-                    }
+                if let Ok(url) = reqwest::Url::parse(url_str)
+                    && let Some(host) = url.host_str()
+                {
+                    return Some(format!("{}:51821", host));
                 }
                 None
             })
@@ -276,7 +276,7 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
 /// What the CLI asked us to do: print a fresh keypair, or run with settings.
 pub(crate) enum Startup {
     GenKeys,
-    Run(DaemonSettings),
+    Run(Box<DaemonSettings>),
 }
 
 /// Parse argv and resolve into a Startup decision (keeps Args private here).
@@ -285,7 +285,7 @@ pub(crate) fn parse_startup() -> Result<Startup, Box<dyn std::error::Error>> {
     if args.gen_keys {
         Ok(Startup::GenKeys)
     } else {
-        Ok(Startup::Run(resolve_settings(&args)?))
+        Ok(Startup::Run(Box::new(resolve_settings(&args)?)))
     }
 }
 

@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn probe_constants_are_sensible() {
-        assert!(PROBE_COUNT >= 1, "must send at least one probe");
-        assert!(PROBE_INTERVAL_MS >= 50, "interval too small");
+        const { assert!(PROBE_COUNT >= 1, "must send at least one probe") };
+        const { assert!(PROBE_INTERVAL_MS >= 50, "interval too small") };
     }
 }

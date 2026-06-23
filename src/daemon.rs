@@ -23,8 +23,8 @@ pub struct MagicConfig {
     pub probe: u8,
 }
 
-impl MagicConfig {
-    pub fn default() -> Self {
+impl Default for MagicConfig {
+    fn default() -> Self {
         Self {
             handshake_init: 0x01,
             handshake_resp: 0x02,
@@ -488,12 +488,11 @@ impl Peer {
             }
             active.rx_bytes += payload.len() as u64;
             plaintext.truncate(len);
-            if !plaintext.is_empty() {
-                if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
-                    if total_len <= plaintext.len() {
-                        plaintext.truncate(total_len);
-                    }
-                }
+            if !plaintext.is_empty()
+                && let Some(total_len) = parse_ipv4_total_length(&plaintext)
+                && total_len <= plaintext.len()
+            {
+                plaintext.truncate(total_len);
             }
             self.last_rx = Instant::now();
             return Some(plaintext);
@@ -512,12 +511,11 @@ impl Peer {
             }
             prev.rx_bytes += payload.len() as u64;
             plaintext.truncate(len);
-            if !plaintext.is_empty() {
-                if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
-                    if total_len <= plaintext.len() {
-                        plaintext.truncate(total_len);
-                    }
-                }
+            if !plaintext.is_empty()
+                && let Some(total_len) = parse_ipv4_total_length(&plaintext)
+                && total_len <= plaintext.len()
+            {
+                plaintext.truncate(total_len);
             }
             self.last_rx = Instant::now();
             return Some(plaintext);
@@ -636,7 +634,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Public Key (hex): {}", hex::encode(keypair.public));
             return Ok(());
         }
-        Startup::Run(s) => s,
+        Startup::Run(s) => *s,
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -900,10 +898,10 @@ pub async fn run_with_settings(
                             "Key rotation triggered for peer {}. Initiating handshake...",
                             hex::encode(&peer.pubkey)
                         );
-                        if let Some(packet) = peer.initiate_handshake(&local_priv) {
-                            if let Some(dest) = peer.determine_dest(has_relay) {
-                                actions.push((packet, dest));
-                            }
+                        if let Some(packet) = peer.initiate_handshake(&local_priv)
+                            && let Some(dest) = peer.determine_dest(has_relay)
+                        {
+                            actions.push((packet, dest));
                         }
                     }
 
@@ -920,10 +918,10 @@ pub async fn run_with_settings(
                     // 3. Check keepalive
                     if peer.active.is_some() && peer.last_tx.elapsed().as_secs() >= 10 {
                         tracing::debug!("Sending keepalive to peer {}", hex::encode(&peer.pubkey));
-                        if let Some(packet) = peer.encrypt_packet(&[]) {
-                            if let Some(dest) = peer.determine_dest(has_relay) {
-                                actions.push((packet, dest));
-                            }
+                        if let Some(packet) = peer.encrypt_packet(&[])
+                            && let Some(dest) = peer.determine_dest(has_relay)
+                        {
+                            actions.push((packet, dest));
                         }
                     }
 
@@ -936,10 +934,10 @@ pub async fn run_with_settings(
                             "No active session for peer {}. Initiating handshake...",
                             hex::encode(&peer.pubkey)
                         );
-                        if let Some(packet) = peer.initiate_handshake(&local_priv) {
-                            if let Some(dest) = peer.determine_dest(has_relay) {
-                                actions.push((packet, dest));
-                            }
+                        if let Some(packet) = peer.initiate_handshake(&local_priv)
+                            && let Some(dest) = peer.determine_dest(has_relay)
+                        {
+                            actions.push((packet, dest));
                         }
                     } else if let Some(attempt) = peer.last_handshake_attempt
                         && attempt.elapsed().as_secs() >= 2
@@ -949,19 +947,19 @@ pub async fn run_with_settings(
                             hex::encode(&peer.pubkey)
                         );
                         peer.last_handshake_attempt = Some(Instant::now());
-                        if let Some(packet) = &peer.last_handshake_packet {
-                            if let Some(dest) = peer.determine_dest(has_relay) {
-                                actions.push((packet.clone(), dest));
-                            }
+                        if let Some(packet) = &peer.last_handshake_packet
+                            && let Some(dest) = peer.determine_dest(has_relay)
+                        {
+                            actions.push((packet.clone(), dest));
                         }
                     }
                 }
             }
 
-            if let Some(status) = status_to_send {
-                if let Some(ref tx) = status_tx_timer {
-                    let _ = tx.send(status).await;
-                }
+            if let Some(status) = status_to_send
+                && let Some(ref tx) = status_tx_timer
+            {
+                let _ = tx.send(status).await;
             }
 
             for (packet, dest) in actions {
@@ -1451,46 +1449,45 @@ async fn process_relayed_packet(
                 && let Some(remote_static_ref) = hs.get_remote_static()
             {
                 let remote_static = remote_static_ref.to_vec();
-                if remote_static == pkt.from_key {
-                    if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == remote_static)
-                    {
-                        let mut resp_msg = vec![0u8; 128];
-                        if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
-                            resp_msg.truncate(len);
-                            if let Ok(stateless_transport) = hs.into_stateless_transport_mode() {
-                                tracing::info!(
-                                    "Handshake complete for peer {} (initiator) via relay. Transitioning to Transport mode.",
-                                    hex::encode(remote_static)
-                                );
+                if remote_static == pkt.from_key
+                    && let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == remote_static)
+                {
+                    let mut resp_msg = vec![0u8; 128];
+                    if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
+                        resp_msg.truncate(len);
+                        if let Ok(stateless_transport) = hs.into_stateless_transport_mode() {
+                            tracing::info!(
+                                "Handshake complete for peer {} (initiator) via relay. Transitioning to Transport mode.",
+                                hex::encode(remote_static)
+                            );
 
-                                if let Some(active) = peer.active.take() {
-                                    peer.previous = Some(active);
-                                }
-                                peer.active = Some(ActiveSession {
-                                    state: stateless_transport,
-                                    tx_nonce: 0,
-                                    established_at: Instant::now(),
-                                    tx_bytes: 0,
-                                    rx_bytes: 0,
-                                    replay: ReplayWindow::new(),
-                                });
-                                peer.last_rx = Instant::now();
-                                peer.last_tx = Instant::now();
-
-                                use rand::RngCore;
-                                let mut resp_packet = Vec::with_capacity(1 + len + 64);
-                                resp_packet.push(magic.handshake_resp);
-                                resp_packet.extend_from_slice(&resp_msg);
-                                let pad_len = rand::thread_rng().gen_range(0..=64);
-                                let mut padding = vec![0u8; pad_len];
-                                rand::thread_rng().fill_bytes(&mut padding);
-                                resp_packet.extend_from_slice(&padding);
-
-                                return Some(OutboundRelayPacket {
-                                    dest_key: pkt.from_key,
-                                    payload: resp_packet,
-                                });
+                            if let Some(active) = peer.active.take() {
+                                peer.previous = Some(active);
                             }
+                            peer.active = Some(ActiveSession {
+                                state: stateless_transport,
+                                tx_nonce: 0,
+                                established_at: Instant::now(),
+                                tx_bytes: 0,
+                                rx_bytes: 0,
+                                replay: ReplayWindow::new(),
+                            });
+                            peer.last_rx = Instant::now();
+                            peer.last_tx = Instant::now();
+
+                            use rand::RngCore;
+                            let mut resp_packet = Vec::with_capacity(1 + len + 64);
+                            resp_packet.push(magic.handshake_resp);
+                            resp_packet.extend_from_slice(&resp_msg);
+                            let pad_len = rand::thread_rng().gen_range(0..=64);
+                            let mut padding = vec![0u8; pad_len];
+                            rand::thread_rng().fill_bytes(&mut padding);
+                            resp_packet.extend_from_slice(&padding);
+
+                            return Some(OutboundRelayPacket {
+                                dest_key: pkt.from_key,
+                                payload: resp_packet,
+                            });
                         }
                     }
                 }
@@ -1506,26 +1503,24 @@ async fn process_relayed_packet(
         let decrypted = {
             let mut manager = pm.lock().unwrap();
             let mut result = None;
-            if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key) {
-                if let Some(plaintext) = peer.decrypt_packet(payload) {
-                    if let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext) {
-                        if peer.allowed_ips.iter().any(|s| s.contains(src_ip)) {
-                            result = Some(plaintext);
-                        } else {
-                            tracing::warn!("Cryptokey routing check failed for relayed packet");
-                        }
-                    }
+            if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key)
+                && let Some(plaintext) = peer.decrypt_packet(payload)
+                && let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext)
+            {
+                if peer.allowed_ips.iter().any(|s| s.contains(src_ip)) {
+                    result = Some(plaintext);
+                } else {
+                    tracing::warn!("Cryptokey routing check failed for relayed packet");
                 }
             }
             result
         };
 
-        if let Some(plaintext) = decrypted {
-            if !plaintext.is_empty() {
-                if let Err(e) = dev_tx.send(&plaintext).await {
-                    tracing::error!("Failed to write relayed packet to TUN: {:?}", e);
-                }
-            }
+        if let Some(plaintext) = decrypted
+            && !plaintext.is_empty()
+            && let Err(e) = dev_tx.send(&plaintext).await
+        {
+            tracing::error!("Failed to write relayed packet to TUN: {:?}", e);
         }
     }
     None
@@ -2135,8 +2130,8 @@ mod tests {
         mock_ipv4_packet[12..16].copy_from_slice(&[10, 0, 99, 1]);
         mock_ipv4_packet[16..20].copy_from_slice(&[10, 0, 99, 2]);
         // Fill the rest with dummy payload data
-        for i in 20..40 {
-            mock_ipv4_packet[i] = i as u8;
+        for (i, byte) in mock_ipv4_packet.iter_mut().enumerate().take(40).skip(20) {
+            *byte = i as u8;
         }
 
         // Encrypt on sender

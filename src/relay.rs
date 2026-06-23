@@ -120,7 +120,7 @@ impl RelayClient {
                         break;
                     }
                     let frame_len = u32::from_be_bytes(len_buf) as usize;
-                    if frame_len < 32 || frame_len > 65536 {
+                    if !(32..=65536).contains(&frame_len) {
                         tracing::warn!("Relay: invalid frame length {}", frame_len);
                         break;
                     }
