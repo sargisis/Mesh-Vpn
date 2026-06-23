@@ -106,6 +106,10 @@ struct Args {
     /// Public UDP endpoint to advertise to the coordinator (e.g. 192.168.100.1:50000).
     #[arg(long)]
     public_endpoint: Option<String>,
+
+    /// TCP relay server address (e.g. 192.168.100.1:51821).
+    #[arg(long)]
+    relay_addr: Option<String>,
 }
 
 /// Device configuration loaded from a TOML file (Phase 3 device config file).
@@ -124,6 +128,7 @@ struct FileConfig {
     #[serde(default)]
     peer: Vec<PeerDescriptor>,
     coordinator_url: Option<String>,
+    relay_addr: Option<String>,
     auth_key: Option<String>,
     hostname: Option<String>,
     public_endpoint: Option<String>,
@@ -149,6 +154,7 @@ pub(crate) struct DaemonSettings {
     pub(crate) private_key_hex: String,
     pub(crate) peer_specs: Vec<String>,
     pub(crate) coordinator_url: Option<String>,
+    pub(crate) relay_addr: Option<String>,
     pub(crate) auth_key: Option<String>,
     pub(crate) hostname: Option<String>,
     pub(crate) public_endpoint: Option<String>,
@@ -167,9 +173,16 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             .parse::<SocketAddr>()
             .map_err(|e| format!("Invalid local_udp '{}' in config: {}", cfg.local_udp, e))?;
 
-        if cfg.coordinator_url.is_none() && cfg.tun_ip.is_none() {
-            return Err("Missing required field in config: tun_ip (or use coordinator_url)".into());
-        }
+        let relay_addr = cfg.relay_addr.or_else(|| {
+            cfg.coordinator_url.as_ref().and_then(|url_str| {
+                if let Ok(url) = reqwest::Url::parse(url_str) {
+                    if let Some(host) = url.host_str() {
+                        return Some(format!("{}:51821", host));
+                    }
+                }
+                None
+            })
+        });
 
         Ok(DaemonSettings {
             tun_name: cfg.tun_name,
@@ -179,6 +192,7 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             private_key_hex: cfg.private_key,
             peer_specs: cfg.peer.iter().map(PeerDescriptor::to_spec).collect(),
             coordinator_url: cfg.coordinator_url,
+            relay_addr,
             auth_key: cfg.auth_key,
             hostname: cfg.hostname,
             public_endpoint: cfg.public_endpoint,
@@ -195,6 +209,18 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
         let private_key_hex = args.private_key.clone().ok_or_else(|| {
             "Missing required argument: --private-key (or use --config)".to_string()
         })?;
+
+        let relay_addr = args.relay_addr.clone().or_else(|| {
+            args.coordinator_url.as_ref().and_then(|url_str| {
+                if let Ok(url) = reqwest::Url::parse(url_str) {
+                    if let Some(host) = url.host_str() {
+                        return Some(format!("{}:51821", host));
+                    }
+                }
+                None
+            })
+        });
+
         Ok(DaemonSettings {
             tun_name: args.tun_name.clone(),
             tun_ip,
@@ -203,6 +229,7 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             private_key_hex,
             peer_specs: args.peer.clone(),
             coordinator_url: args.coordinator_url.clone(),
+            relay_addr,
             auth_key: args.auth_key.clone(),
             hostname: args.hostname.clone(),
             public_endpoint: args.public_endpoint.clone(),

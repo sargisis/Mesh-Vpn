@@ -22,6 +22,10 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub assigned_ip: String,
     pub peers: Vec<PeerDescriptor>,
+    /// The external `ip:port` of the registering node as observed by the
+    /// coordinator from the TCP connection (STUN-like reflexive address).
+    #[serde(default)]
+    pub observed_endpoint: Option<String>,
 }
 
 /// A periodic refresh from an already-registered node. Re-advertises the
