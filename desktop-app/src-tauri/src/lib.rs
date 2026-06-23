@@ -4,12 +4,12 @@
 //! using shared state protected by a Mutex for thread-safe access.
 
 use araxmesh::config::DaemonSettings;
-use araxmesh::{DaemonStatus, run_with_settings};
+use araxmesh::{run_with_settings, DaemonStatus};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Settings submitted from the React frontend via JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +62,10 @@ fn to_daemon_settings(fs: &FrontendSettings) -> Result<DaemonSettings, String> {
     Ok(DaemonSettings {
         tun_name: fs.tun_name.clone().unwrap_or_else(|| "arax0".to_string()),
         tun_ip: fs.tun_ip.clone(),
-        tun_netmask: fs.tun_netmask.clone().unwrap_or_else(|| "255.255.255.0".to_string()),
+        tun_netmask: fs
+            .tun_netmask
+            .clone()
+            .unwrap_or_else(|| "255.255.255.0".to_string()),
         local_udp,
         private_key_hex: fs.private_key.clone(),
         peer_specs: fs.peers.clone().unwrap_or_default(),
