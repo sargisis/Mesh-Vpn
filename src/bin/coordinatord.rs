@@ -26,7 +26,11 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "AraxMesh coordinator (control plane + relay)")]
+#[command(
+    author,
+    version,
+    about = "AraxMesh coordinator (control plane + relay)"
+)]
 struct Args {
     /// Address to listen on for the HTTP API.
     #[arg(long, default_value = "0.0.0.0:51820")]
@@ -121,10 +125,7 @@ async fn run_relay(listener: TcpListener, routes: RelayRoutes) {
 }
 
 /// Handle one relay client: read identity, then split into TX/RX loops.
-async fn handle_relay_client(
-    mut stream: tokio::net::TcpStream,
-    routes: RelayRoutes,
-) {
+async fn handle_relay_client(mut stream: tokio::net::TcpStream, routes: RelayRoutes) {
     // 1. Read 32-byte identity.
     let mut identity = [0u8; 32];
     if let Err(e) = stream.read_exact(&mut identity).await {
@@ -169,7 +170,11 @@ async fn handle_relay_client(
             }
             let frame_len = u32::from_be_bytes(len_buf) as usize;
             if frame_len < 32 || frame_len > 65536 {
-                tracing::warn!("Relay: invalid frame length {} from {}", frame_len, hex::encode(identity));
+                tracing::warn!(
+                    "Relay: invalid frame length {} from {}",
+                    frame_len,
+                    hex::encode(identity)
+                );
                 break;
             }
 
@@ -196,10 +201,7 @@ async fn handle_relay_client(
                     );
                 }
             } else {
-                tracing::debug!(
-                    "Relay: no route to destination {}",
-                    hex::encode(dest_key)
-                );
+                tracing::debug!("Relay: no route to destination {}", hex::encode(dest_key));
             }
         }
     };

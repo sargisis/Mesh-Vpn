@@ -10,5 +10,5 @@ pub mod packet;
 pub mod relay;
 mod types;
 
-pub use daemon::{run, run_with_settings, DaemonStatus, PeerStatus};
+pub use daemon::{DaemonStatus, PeerStatus, run, run_with_settings};
 pub use types::PeerDescriptor;

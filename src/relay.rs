@@ -212,13 +212,10 @@ mod tests {
         .unwrap();
 
         // The echo relay reflects it back with our identity as from_key.
-        let echoed = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("should receive within timeout")
-        .expect("channel should not be closed");
+        let echoed = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("should receive within timeout")
+            .expect("channel should not be closed");
 
         assert_eq!(echoed.from_key, pubkey);
         assert_eq!(echoed.payload, payload);

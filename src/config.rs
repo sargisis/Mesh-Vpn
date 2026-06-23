@@ -48,9 +48,8 @@ pub(crate) fn parse_peer_arg(s: &str) -> Result<ParsedPeer, Box<dyn std::error::
         .split(',')
         .map(|part| part.trim().parse::<crate::packet::Ipv4Subnet>())
         .collect();
-    let allowed_ips = allowed_ips.map_err(|e| {
-        format!("Invalid allowed IP(s) '{}': {}", allowed_ip_str, e)
-    })?;
+    let allowed_ips =
+        allowed_ips.map_err(|e| format!("Invalid allowed IP(s) '{}': {}", allowed_ip_str, e))?;
 
     Ok(ParsedPeer {
         pubkey,
@@ -233,7 +232,8 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
         let coordinator_url = args.coordinator_url.clone();
         let tun_ip = if coordinator_url.is_none() {
             Some(args.tun_ip.clone().ok_or_else(|| {
-                "Missing required argument: --tun-ip (or use --config or --coordinator-url)".to_string()
+                "Missing required argument: --tun-ip (or use --config or --coordinator-url)"
+                    .to_string()
             })?)
         } else {
             args.tun_ip.clone()
@@ -304,7 +304,10 @@ mod tests {
         let p = parse_peer_arg(&s).expect("valid peer");
         assert_eq!(p.pubkey, vec![0xab; 32]);
         assert_eq!(p.endpoint, Some("192.168.1.5:50002".parse().unwrap()));
-        assert_eq!(p.allowed_ips, vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]);
+        assert_eq!(
+            p.allowed_ips,
+            vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]
+        );
     }
 
     #[test]
@@ -313,7 +316,10 @@ mod tests {
         let s = format!("{};;10.0.99.2", valid_pubkey_hex());
         let p = parse_peer_arg(&s).expect("valid inbound-only peer");
         assert!(p.endpoint.is_none());
-        assert_eq!(p.allowed_ips, vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]);
+        assert_eq!(
+            p.allowed_ips,
+            vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]
+        );
     }
 
     #[test]

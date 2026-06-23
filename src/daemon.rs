@@ -3,9 +3,10 @@
 use crate::config::{Startup, parse_peer_arg, parse_startup};
 use crate::control::{PollRequest, PollResponse, RegisterRequest, RegisterResponse};
 use crate::nat;
-use rand::{Rng, RngCore};
 use crate::packet::{parse_ipv4_header, parse_ipv4_total_length};
+use crate::relay::{OutboundRelayPacket, RelayClient, RelayedPacket};
 use crate::types::PeerDescriptor;
+use rand::{Rng, RngCore};
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +14,6 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tun_rs::DeviceBuilder;
-use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MagicConfig {
@@ -52,7 +52,6 @@ pub struct DaemonStatus {
     pub total_downloaded: u64,
     pub peers: Vec<PeerStatus>,
 }
-
 
 /// Exponential backoff for reconnect / retry loops: start small, double on each
 /// failure up to a cap, and `reset` after a success. Keeps a flapping coordinator
@@ -208,7 +207,11 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(pubkey: Vec<u8>, endpoint: Option<SocketAddr>, allowed_ips: Vec<crate::packet::Ipv4Subnet>) -> Self {
+    fn new(
+        pubkey: Vec<u8>,
+        endpoint: Option<SocketAddr>,
+        allowed_ips: Vec<crate::packet::Ipv4Subnet>,
+    ) -> Self {
         Self {
             pubkey,
             endpoint,
@@ -236,7 +239,6 @@ impl Peer {
     }
 
     fn initiate_handshake(&mut self, local_priv: &[u8]) -> Option<Vec<u8>> {
-
         let mut builder = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
         builder = builder.local_private_key(local_priv);
         builder = builder.remote_public_key(&self.pubkey);
@@ -293,8 +295,7 @@ impl Peer {
     ) -> Option<Vec<u8>> {
         if packet_type == self.magic.handshake_init {
             let payload = &payload[..96.min(payload.len())];
-            let mut builder =
-                Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+            let mut builder = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
             builder = builder.local_private_key(local_priv);
 
             match builder.build_responder() {
@@ -399,7 +400,7 @@ impl Peer {
 
                         self.active = Some(ActiveSession {
                             state: stateless_transport,
-                            tx_nonce: 0,                            
+                            tx_nonce: 0,
                             established_at: Instant::now(),
                             tx_bytes: 0,
                             rx_bytes: 0,
@@ -443,7 +444,10 @@ impl Peer {
         }
 
         let mut ciphertext = vec![0u8; padded_payload.len() + 16];
-        match active.state.write_message(nonce, &padded_payload, &mut ciphertext) {
+        match active
+            .state
+            .write_message(nonce, &padded_payload, &mut ciphertext)
+        {
             Ok(len) => {
                 ciphertext.truncate(len);
                 self.last_tx = Instant::now();
@@ -500,7 +504,10 @@ impl Peer {
             && let Ok(len) = prev.state.read_message(nonce, ciphertext, &mut plaintext)
         {
             if !prev.replay.check_and_update(nonce) {
-                tracing::debug!("Dropping replayed/too-old packet, nonce {} (previous session)", nonce);
+                tracing::debug!(
+                    "Dropping replayed/too-old packet, nonce {} (previous session)",
+                    nonce
+                );
                 return None;
             }
             prev.rx_bytes += payload.len() as u64;
@@ -547,7 +554,11 @@ impl PeerManager {
         for peer in &mut peers {
             peer.magic = magic;
         }
-        Self { local_priv, peers, magic }
+        Self {
+            local_priv,
+            peers,
+            magic,
+        }
     }
 
     /// Reconcile the peer table with the set advertised by the coordinator:
@@ -699,7 +710,10 @@ pub async fn run_with_settings(
             }
         };
 
-        tracing::info!("Successfully registered. Assigned IP: {}", reg_resp.assigned_ip);
+        tracing::info!(
+            "Successfully registered. Assigned IP: {}",
+            reg_resp.assigned_ip
+        );
         if let Some(ref obs) = reg_resp.observed_endpoint {
             tracing::info!("Observed external endpoint (STUN-like): {}", obs);
         }
@@ -708,7 +722,11 @@ pub async fn run_with_settings(
         for p_desc in reg_resp.peers {
             match parse_peer_arg(&p_desc.to_spec()) {
                 Ok(parsed) => {
-                    parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ips));
+                    parsed_peers.push(Peer::new(
+                        parsed.pubkey,
+                        parsed.endpoint,
+                        parsed.allowed_ips,
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse peer from coordinator: {}", e);
@@ -720,7 +738,11 @@ pub async fn run_with_settings(
         let mut parsed_peers = Vec::new();
         for p_str in &settings.peer_specs {
             let parsed = parse_peer_arg(p_str)?;
-            parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ips));
+            parsed_peers.push(Peer::new(
+                parsed.pubkey,
+                parsed.endpoint,
+                parsed.allowed_ips,
+            ));
         }
 
         if parsed_peers.is_empty() {
@@ -745,7 +767,9 @@ pub async fn run_with_settings(
     );
     tracing::info!("Local UDP Bind: {}", settings.local_udp);
     for peer in &peers {
-        let allowed_ips_str = peer.allowed_ips.iter()
+        let allowed_ips_str = peer
+            .allowed_ips
+            .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join(",");
@@ -764,7 +788,11 @@ pub async fn run_with_settings(
         probe: settings.magic_probe,
     };
 
-    let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, peers, magic_config)));
+    let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(
+        local_priv,
+        peers,
+        magic_config,
+    )));
 
     let dev = DeviceBuilder::new()
         .name(&settings.tun_name)
@@ -789,8 +817,16 @@ pub async fn run_with_settings(
 
     let (relay_send_tx, mut relay_send_rx) = mpsc::channel::<OutboundRelayPacket>(128);
     let has_relay = settings.relay_addr.is_some();
-    let relay_tx_timer = if has_relay { Some(relay_send_tx.clone()) } else { None };
-    let relay_tx_tun = if has_relay { Some(relay_send_tx.clone()) } else { None };
+    let relay_tx_timer = if has_relay {
+        Some(relay_send_tx.clone())
+    } else {
+        None
+    };
+    let relay_tx_tun = if has_relay {
+        Some(relay_send_tx.clone())
+    } else {
+        None
+    };
 
     // Handshake retransmission, keepalive, key rotation timer
     let session_timer = pm.clone();
@@ -823,8 +859,14 @@ pub async fn run_with_settings(
                         total_uploaded += tx_bytes;
                         total_downloaded += rx_bytes;
 
-                        let last_rx_secs_ago = peer.active.as_ref().map(|s| s.established_at.elapsed().as_secs());
-                        let last_tx_secs_ago = peer.active.as_ref().map(|s| s.established_at.elapsed().as_secs());
+                        let last_rx_secs_ago = peer
+                            .active
+                            .as_ref()
+                            .map(|s| s.established_at.elapsed().as_secs());
+                        let last_tx_secs_ago = peer
+                            .active
+                            .as_ref()
+                            .map(|s| s.established_at.elapsed().as_secs());
 
                         peer_statuses.push(PeerStatus {
                             pubkey: hex::encode(&peer.pubkey),
@@ -886,7 +928,9 @@ pub async fn run_with_settings(
                     }
 
                     // 4. Retransmit or initiate handshake if no active session
-                    if peer.active.is_none() && peer.handshake.is_none() && (peer.endpoint.is_some() || has_relay)
+                    if peer.active.is_none()
+                        && peer.handshake.is_none()
+                        && (peer.endpoint.is_some() || has_relay)
                     {
                         tracing::info!(
                             "No active session for peer {}. Initiating handshake...",
@@ -929,7 +973,12 @@ pub async fn run_with_settings(
                     }
                     OutboundDest::Relay(dest_key) => {
                         if let Some(ref tx) = relay_tx_timer {
-                            let _ = tx.send(OutboundRelayPacket { dest_key, payload: packet }).await;
+                            let _ = tx
+                                .send(OutboundRelayPacket {
+                                    dest_key,
+                                    payload: packet,
+                                })
+                                .await;
                         }
                     }
                 }
@@ -970,7 +1019,9 @@ pub async fn run_with_settings(
                                     && peer.handshake.is_none()
                                     && let Some(hs_packet) = peer.initiate_handshake(&local_priv)
                                 {
-                                    let allowed_ips_str = peer.allowed_ips.iter()
+                                    let allowed_ips_str = peer
+                                        .allowed_ips
+                                        .iter()
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>()
                                         .join(",");
@@ -1001,7 +1052,12 @@ pub async fn run_with_settings(
                                 }
                                 OutboundDest::Relay(dest_key) => {
                                     if let Some(ref tx) = relay_tx_tun {
-                                        let _ = tx.send(OutboundRelayPacket { dest_key, payload: packet }).await;
+                                        let _ = tx
+                                            .send(OutboundRelayPacket {
+                                                dest_key,
+                                                payload: packet,
+                                            })
+                                            .await;
                                     }
                                 }
                             }
@@ -1029,7 +1085,12 @@ pub async fn run_with_settings(
 
                     let (magic_init, magic_resp, magic_data, magic_probe) = {
                         let manager = pm_rx.lock().unwrap();
-                        (manager.magic.handshake_init, manager.magic.handshake_resp, manager.magic.data, manager.magic.probe)
+                        (
+                            manager.magic.handshake_init,
+                            manager.magic.handshake_resp,
+                            manager.magic.data,
+                            manager.magic.probe,
+                        )
                     };
 
                     let packet_type = buf[0];
@@ -1086,7 +1147,8 @@ pub async fn run_with_settings(
                                                 peer.last_tx = Instant::now();
 
                                                 use rand::RngCore;
-                                                let mut resp_packet = Vec::with_capacity(1 + len + 64);
+                                                let mut resp_packet =
+                                                    Vec::with_capacity(1 + len + 64);
                                                 resp_packet.push(magic.handshake_resp);
                                                 resp_packet.extend_from_slice(&resp_msg);
                                                 let pad_len = rand::thread_rng().gen_range(0..=64);
@@ -1143,7 +1205,9 @@ pub async fn run_with_settings(
                                     peer.last_direct_rx = Instant::now();
                                     result = Some(plaintext);
                                 } else {
-                                    let allowed_ips_str = peer.allowed_ips.iter()
+                                    let allowed_ips_str = peer
+                                        .allowed_ips
+                                        .iter()
                                         .map(|s| s.to_string())
                                         .collect::<Vec<_>>()
                                         .join(",");
@@ -1241,14 +1305,20 @@ pub async fn run_with_settings(
                     Ok(resp) => {
                         match resp.json::<PollResponse>().await {
                             Ok(poll_resp) => {
-                                tracing::debug!("Successfully polled coordinator. Reconciling {} peers.", poll_resp.peers.len());
+                                tracing::debug!(
+                                    "Successfully polled coordinator. Reconciling {} peers.",
+                                    poll_resp.peers.len()
+                                );
                                 let (new_endpoints, probe_byte) = {
                                     let mut manager = pm_poll.lock().unwrap();
                                     (manager.sync_peers(&poll_resp.peers), manager.magic.probe)
                                 };
                                 // Punch holes for any newly discovered peers.
                                 for ep in new_endpoints {
-                                    tracing::info!("New peer discovered at {}; initiating hole punch", ep);
+                                    tracing::info!(
+                                        "New peer discovered at {}; initiating hole punch",
+                                        ep
+                                    );
                                     let s = sock_poll.clone();
                                     tokio::spawn(async move {
                                         nat::punch_hole(&s, ep, probe_byte).await;
@@ -1297,7 +1367,9 @@ pub async fn run_with_settings(
 
                         let rx_forward = async {
                             while let Some(pkt) = relay_client_rx.recv().await {
-                                if let Some(resp) = process_relayed_packet(&pm_relay, &dev_tx_relay, pkt).await {
+                                if let Some(resp) =
+                                    process_relayed_packet(&pm_relay, &dev_tx_relay, pkt).await
+                                {
                                     let _ = relay_send_tx_clone.send(resp).await;
                                 }
                             }
@@ -1380,7 +1452,8 @@ async fn process_relayed_packet(
             {
                 let remote_static = remote_static_ref.to_vec();
                 if remote_static == pkt.from_key {
-                    if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == remote_static) {
+                    if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == remote_static)
+                    {
                         let mut resp_msg = vec![0u8; 128];
                         if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
                             resp_msg.truncate(len);
@@ -1521,28 +1594,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_coordinator_registration_and_polling() {
-        use axum::{routing::post, Router, Json, extract::State};
-        use std::sync::{Arc, Mutex};
+        use crate::control::{PollRequest, PollResponse, RegisterRequest, RegisterResponse};
         use crate::coordinator::Registry;
-        use crate::control::{RegisterRequest, RegisterResponse, PollRequest, PollResponse};
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
 
         let registry = Registry::new("10.0.99.0/24").unwrap();
         let state = Arc::new(Mutex::new(registry));
 
-        let app = Router::new()
-            .route("/register", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<RegisterRequest>| async move {
-                let mut reg = state.lock().unwrap();
-                let (assigned_ip, observed_endpoint) = reg.register(&req.public_key, req.endpoint, req.hostname, None).unwrap();
-                let peers = reg.peers_for(&req.public_key);
-                Json(RegisterResponse { assigned_ip, peers, observed_endpoint })
-            }))
-            .route("/poll", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<PollRequest>| async move {
-                let mut reg = state.lock().unwrap();
-                reg.poll(&req.public_key, req.endpoint, None).unwrap();
-                let peers = reg.peers_for(&req.public_key);
-                Json(PollResponse { peers })
-            }))
-            .with_state(state);
+        let app =
+            Router::new()
+                .route(
+                    "/register",
+                    post(
+                        |State(state): State<Arc<Mutex<Registry>>>,
+                         Json(req): Json<RegisterRequest>| async move {
+                            let mut reg = state.lock().unwrap();
+                            let (assigned_ip, observed_endpoint) = reg
+                                .register(&req.public_key, req.endpoint, req.hostname, None)
+                                .unwrap();
+                            let peers = reg.peers_for(&req.public_key);
+                            Json(RegisterResponse {
+                                assigned_ip,
+                                peers,
+                                observed_endpoint,
+                            })
+                        },
+                    ),
+                )
+                .route(
+                    "/poll",
+                    post(
+                        |State(state): State<Arc<Mutex<Registry>>>,
+                         Json(req): Json<PollRequest>| async move {
+                            let mut reg = state.lock().unwrap();
+                            reg.poll(&req.public_key, req.endpoint, None).unwrap();
+                            let peers = reg.peers_for(&req.public_key);
+                            Json(PollResponse { peers })
+                        },
+                    ),
+                )
+                .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
@@ -1617,7 +1709,11 @@ mod tests {
 
     #[test]
     fn test_determine_dest_no_relay() {
-        let peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), vec!["10.0.99.2".parse().unwrap()]);
+        let peer = Peer::new(
+            vec![0xbb; 32],
+            Some("1.2.3.4:50002".parse().unwrap()),
+            vec!["10.0.99.2".parse().unwrap()],
+        );
 
         // If has_relay is false, and endpoint is Some, it should return Udp(endpoint).
         let dest = peer.determine_dest(false);
@@ -1634,7 +1730,11 @@ mod tests {
 
     #[test]
     fn test_determine_dest_with_relay_fallback() {
-        let mut peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), vec!["10.0.99.2".parse().unwrap()]);
+        let mut peer = Peer::new(
+            vec![0xbb; 32],
+            Some("1.2.3.4:50002".parse().unwrap()),
+            vec!["10.0.99.2".parse().unwrap()],
+        );
 
         // Initially last_direct_rx is Instant::now(), so last_direct_rx.elapsed() < 10.
         // It should use direct UDP.
@@ -1657,22 +1757,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_relay_fallback() {
-        use axum::{routing::post, Router, Json, extract::State};
-        use std::sync::{Arc, Mutex};
-        use crate::coordinator::Registry;
         use crate::control::{RegisterRequest, RegisterResponse};
-        use crate::relay::{RelayClient, OutboundRelayPacket};
+        use crate::coordinator::Registry;
+        use crate::relay::{OutboundRelayPacket, RelayClient};
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
 
         // 1. Mock Coordinator
         let registry = Registry::new("10.0.99.0/24").unwrap();
         let state = Arc::new(Mutex::new(registry));
         let app = Router::new()
-            .route("/register", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<RegisterRequest>| async move {
-                let mut reg = state.lock().unwrap();
-                let (assigned_ip, observed_endpoint) = reg.register(&req.public_key, req.endpoint, req.hostname, None).unwrap();
-                let peers = reg.peers_for(&req.public_key);
-                Json(RegisterResponse { assigned_ip, peers, observed_endpoint })
-            }))
+            .route(
+                "/register",
+                post(
+                    |State(state): State<Arc<Mutex<Registry>>>,
+                     Json(req): Json<RegisterRequest>| async move {
+                        let mut reg = state.lock().unwrap();
+                        let (assigned_ip, observed_endpoint) = reg
+                            .register(&req.public_key, req.endpoint, req.hostname, None)
+                            .unwrap();
+                        let peers = reg.peers_for(&req.public_key);
+                        Json(RegisterResponse {
+                            assigned_ip,
+                            peers,
+                            observed_endpoint,
+                        })
+                    },
+                ),
+            )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         tokio::spawn(async move {
@@ -1716,10 +1828,18 @@ mod tests {
         let peer_pubkey = vec![0xbb; 32];
 
         // We set last_direct_rx to 11s ago to simulate fallback.
-        let mut peer = Peer::new(peer_pubkey.clone(), None, vec!["10.0.99.2".parse().unwrap()]);
+        let mut peer = Peer::new(
+            peer_pubkey.clone(),
+            None,
+            vec!["10.0.99.2".parse().unwrap()],
+        );
         peer.last_direct_rx = Instant::now() - std::time::Duration::from_secs(11);
 
-        let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, vec![peer], MagicConfig::default())));
+        let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(
+            local_priv,
+            vec![peer],
+            MagicConfig::default(),
+        )));
 
         // 4. Connect relay client and run tx_forward
         let local_pubkey_arr = [0xaa; 32];
@@ -1738,7 +1858,13 @@ mod tests {
         // Match dest and send it via the relay channel
         match action.1 {
             OutboundDest::Relay(dest_key) => {
-                relay_tx.send(OutboundRelayPacket { dest_key, payload: action.0 }).await.unwrap();
+                relay_tx
+                    .send(OutboundRelayPacket {
+                        dest_key,
+                        payload: action.0,
+                    })
+                    .await
+                    .unwrap();
             }
             _ => panic!("Expected relay destination"),
         }
@@ -1763,7 +1889,11 @@ mod tests {
         let peer_b = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
         let peer_c = Peer::new(vec![0xcc; 32], None, vec!["0.0.0.0/0".parse().unwrap()]);
 
-        let pm = PeerManager::new(vec![0x00; 32], vec![peer_a, peer_b, peer_c], MagicConfig::default());
+        let pm = PeerManager::new(
+            vec![0x00; 32],
+            vec![peer_a, peer_b, peer_c],
+            MagicConfig::default(),
+        );
 
         // 1. Matches A (specific host wins over /24 and /0)
         let ip_a: Ipv4Addr = "10.0.99.5".parse().unwrap();
@@ -1783,8 +1913,16 @@ mod tests {
         // 4. If no exit node, and IP doesn't match subnets, returns None
         let peer_a_no_c = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.5/32".parse().unwrap()]);
         let peer_b_no_c = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
-        let pm_no_c = PeerManager::new(vec![0x00; 32], vec![peer_a_no_c, peer_b_no_c], MagicConfig::default());
-        assert!(pm_no_c.find_best_peer_idx("8.8.8.8".parse().unwrap()).is_none());
+        let pm_no_c = PeerManager::new(
+            vec![0x00; 32],
+            vec![peer_a_no_c, peer_b_no_c],
+            MagicConfig::default(),
+        );
+        assert!(
+            pm_no_c
+                .find_best_peer_idx("8.8.8.8".parse().unwrap())
+                .is_none()
+        );
     }
 
     // --- Gate 6.0: anti-replay -------------------------------------------------
@@ -1837,7 +1975,10 @@ mod tests {
 
         // Advance far past the window; the whole bitmap clears.
         assert!(w.check_and_update(5000));
-        assert!(!w.check_and_update(1), "nonce far behind the window is too old");
+        assert!(
+            !w.check_and_update(1),
+            "nonce far behind the window is too old"
+        );
         assert!(w.check_and_update(5000 - 10), "still inside the window");
     }
 
@@ -1855,7 +1996,9 @@ mod tests {
         assert_eq!(wire[0], 0x03, "transport-data type byte");
         let payload = &wire[1..]; // strip type byte, as the udp_to_tun dispatch does
 
-        let first = receiver.decrypt_packet(payload).expect("first delivery decrypts");
+        let first = receiver
+            .decrypt_packet(payload)
+            .expect("first delivery decrypts");
         assert_eq!(first, plaintext);
 
         // Replaying the identical wire bytes must be dropped by the anti-replay window.
@@ -1896,10 +2039,18 @@ mod tests {
         assert_eq!(b.advance(), Duration::from_secs(4));
         assert_eq!(b.advance(), Duration::from_secs(8));
         assert_eq!(b.advance(), Duration::from_secs(16));
-        assert_eq!(b.advance(), Duration::from_secs(30), "capped at MAX (32 -> 30)");
+        assert_eq!(
+            b.advance(),
+            Duration::from_secs(30),
+            "capped at MAX (32 -> 30)"
+        );
         assert_eq!(b.advance(), Duration::from_secs(30), "stays capped");
         b.reset();
-        assert_eq!(b.advance(), Duration::from_secs(1), "reset returns to INITIAL");
+        assert_eq!(
+            b.advance(),
+            Duration::from_secs(1),
+            "reset returns to INITIAL"
+        );
     }
 
     #[test]
@@ -1917,14 +2068,24 @@ mod tests {
         let builder_receiver = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
         let receiver_keys = builder_receiver.generate_keypair().unwrap();
 
-        let mut sender = Peer::new(receiver_keys.public.clone(), None, vec!["10.0.99.2/32".parse().unwrap()]);
+        let mut sender = Peer::new(
+            receiver_keys.public.clone(),
+            None,
+            vec!["10.0.99.2/32".parse().unwrap()],
+        );
         sender.magic = magic;
 
-        let mut receiver = Peer::new(sender_keys.public.clone(), None, vec!["10.0.99.1/32".parse().unwrap()]);
+        let mut receiver = Peer::new(
+            sender_keys.public.clone(),
+            None,
+            vec!["10.0.99.1/32".parse().unwrap()],
+        );
         receiver.magic = magic;
 
         // Initiate handshake on sender
-        let handshake_init_packet = sender.initiate_handshake(&sender_keys.private).expect("initiate handshake");
+        let handshake_init_packet = sender
+            .initiate_handshake(&sender_keys.private)
+            .expect("initiate handshake");
         assert_eq!(handshake_init_packet[0], magic.handshake_init);
         // The packet length should be at least 1 (type) + 96 (Noise IK handshake msg) = 97 bytes, and potentially up to 97 + 64 = 161 bytes due to padding.
         assert!(handshake_init_packet.len() >= 97);
@@ -1933,11 +2094,13 @@ mod tests {
         // Receive handshake initiation on receiver
         let handshake_init_type = handshake_init_packet[0];
         let handshake_init_payload = &handshake_init_packet[1..];
-        let handshake_resp_packet = receiver.handle_handshake_packet(
-            &receiver_keys.private,
-            handshake_init_type,
-            handshake_init_payload,
-        ).expect("handle handshake initiation and build response");
+        let handshake_resp_packet = receiver
+            .handle_handshake_packet(
+                &receiver_keys.private,
+                handshake_init_type,
+                handshake_init_payload,
+            )
+            .expect("handle handshake initiation and build response");
 
         assert_eq!(handshake_resp_packet[0], magic.handshake_resp);
         // Length should be at least 1 (type) + 48 (Noise IK response msg) = 49 bytes, and up to 49 + 64 = 113 bytes due to padding.
@@ -1952,7 +2115,10 @@ mod tests {
             handshake_resp_type,
             handshake_resp_payload,
         );
-        assert!(none_resp.is_none(), "responder handshake finishes handshakes and returns None");
+        assert!(
+            none_resp.is_none(),
+            "responder handshake finishes handshakes and returns None"
+        );
 
         // Both sender and receiver should now have active sessions in transport mode
         assert!(sender.active.is_some());
@@ -1974,7 +2140,9 @@ mod tests {
         }
 
         // Encrypt on sender
-        let encrypted_packet = sender.encrypt_packet(&mock_ipv4_packet).expect("encrypt packet");
+        let encrypted_packet = sender
+            .encrypt_packet(&mock_ipv4_packet)
+            .expect("encrypt packet");
         assert_eq!(encrypted_packet[0], magic.data);
         // Size should be: 1 (type) + 8 (nonce) + 40 (plaintext) + padding (0 to 128) + 16 (tag)
         // Min size: 1 + 8 + 40 + 0 + 16 = 65
@@ -1984,10 +2152,11 @@ mod tests {
 
         // Decrypt on receiver
         let decrypted_payload = &encrypted_packet[1..]; // strip type byte only, keep 8-byte nonce
-        let decrypted_plaintext = receiver.decrypt_packet(decrypted_payload).expect("decrypt packet");
+        let decrypted_plaintext = receiver
+            .decrypt_packet(decrypted_payload)
+            .expect("decrypt packet");
         // Verify length is truncated exactly to original 40 bytes despite random padding
         assert_eq!(decrypted_plaintext.len(), 40);
         assert_eq!(decrypted_plaintext, mock_ipv4_packet);
     }
 }
-

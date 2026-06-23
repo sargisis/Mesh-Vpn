@@ -246,7 +246,9 @@ mod tests {
         let (a, _) = reg
             .register("aa", "1.1.1.1:50000".into(), Some("a".into()), None)
             .unwrap();
-        let (b, _) = reg.register("bb", "2.2.2.2:50000".into(), None, None).unwrap();
+        let (b, _) = reg
+            .register("bb", "2.2.2.2:50000".into(), None, None)
+            .unwrap();
         assert_eq!(a, "10.0.99.1");
         assert_eq!(b, "10.0.99.2");
     }
