@@ -1,1 +1,4 @@
 /target
+
+# graphify knowledge-graph output (generated, rebuildable via /graphify)
+/graphify-out
