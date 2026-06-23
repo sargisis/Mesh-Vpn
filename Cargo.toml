@@ -13,5 +13,7 @@ tracing-subscriber = "0.3"
 rand = "0.8"
 hex = "0.4"
 snow = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 

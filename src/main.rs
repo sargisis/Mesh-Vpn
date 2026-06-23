@@ -405,6 +405,108 @@ struct Args {
     /// Generate a new Noise static keypair and exit
     #[arg(long)]
     gen_keys: bool,
+
+    /// Path to a TOML config file. When given, it supplies the private key,
+    /// TUN settings and peer table instead of the individual CLI flags.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+}
+
+/// Device configuration loaded from a TOML file (Phase 3 device config file).
+/// Mirrors the CLI flags so a node can be described entirely by one file:
+/// its own private key, TUN settings, and the peer table.
+#[derive(serde::Deserialize, Debug)]
+struct FileConfig {
+    private_key: String,
+    tun_ip: String,
+    #[serde(default = "default_tun_name")]
+    tun_name: String,
+    #[serde(default = "default_tun_netmask")]
+    tun_netmask: String,
+    #[serde(default = "default_local_udp")]
+    local_udp: String,
+    #[serde(default)]
+    peer: Vec<FilePeer>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct FilePeer {
+    public_key: String,
+    endpoint: Option<String>,
+    allowed_ip: String,
+}
+
+impl FilePeer {
+    /// Render into the same `pubkey;[endpoint];allowed_ip` spec the CLI uses,
+    /// so config and `--peer` share one validation path (`parse_peer_arg`).
+    fn to_spec(&self) -> String {
+        format!(
+            "{};{};{}",
+            self.public_key,
+            self.endpoint.as_deref().unwrap_or(""),
+            self.allowed_ip
+        )
+    }
+}
+
+fn default_tun_name() -> String {
+    "arax0".to_string()
+}
+fn default_tun_netmask() -> String {
+    "255.255.255.0".to_string()
+}
+fn default_local_udp() -> String {
+    "0.0.0.0:50001".to_string()
+}
+
+/// Effective daemon settings after merging the config file or CLI flags into
+/// one shape. Peers are kept as CLI-style specs and parsed downstream.
+struct DaemonSettings {
+    tun_name: String,
+    tun_ip: String,
+    tun_netmask: String,
+    local_udp: SocketAddr,
+    private_key_hex: String,
+    peer_specs: Vec<String>,
+}
+
+/// Resolve settings from `--config <file>` if given, otherwise from the CLI
+/// flags (preserving the existing flag-driven behaviour relied on by tests).
+fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.config {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
+        let cfg: FileConfig = toml::from_str(&text)
+            .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
+        let local_udp = cfg
+            .local_udp
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("Invalid local_udp '{}' in config: {}", cfg.local_udp, e))?;
+        Ok(DaemonSettings {
+            tun_name: cfg.tun_name,
+            tun_ip: cfg.tun_ip,
+            tun_netmask: cfg.tun_netmask,
+            local_udp,
+            private_key_hex: cfg.private_key,
+            peer_specs: cfg.peer.iter().map(FilePeer::to_spec).collect(),
+        })
+    } else {
+        let tun_ip = args
+            .tun_ip
+            .clone()
+            .ok_or_else(|| "Missing required argument: --tun-ip (or use --config)".to_string())?;
+        let private_key_hex = args.private_key.clone().ok_or_else(|| {
+            "Missing required argument: --private-key (or use --config)".to_string()
+        })?;
+        Ok(DaemonSettings {
+            tun_name: args.tun_name.clone(),
+            tun_ip,
+            tun_netmask: args.tun_netmask.clone(),
+            local_udp: args.local_udp,
+            private_key_hex,
+            peer_specs: args.peer.clone(),
+        })
+    }
 }
 
 #[tokio::main]
@@ -421,20 +523,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let tun_ip = args.tun_ip.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Missing required argument: --tun-ip",
-        )
-    })?;
-    let private_key_hex = args.private_key.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Missing required argument: --private-key",
-        )
-    })?;
+    let settings = resolve_settings(&args)?;
 
-    let local_priv = hex::decode(&private_key_hex).map_err(|e| {
+    let local_priv = hex::decode(&settings.private_key_hex).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid private-key hex: {}", e),
@@ -452,15 +543,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut peers = Vec::new();
-    for p_str in args.peer {
-        let parsed = parse_peer_arg(&p_str)?;
+    for p_str in &settings.peer_specs {
+        let parsed = parse_peer_arg(p_str)?;
         peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
     }
 
     if peers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "At least one peer configuration must be provided via --peer",
+            "At least one peer must be configured (via --peer or [[peer]] in --config)",
         )
         .into());
     }
@@ -468,11 +559,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting AraxMesh Phase 2 daemon");
     tracing::info!(
         "TUN Interface: {} (IP: {}, Netmask: {})",
-        args.tun_name,
-        tun_ip,
-        args.tun_netmask
+        settings.tun_name,
+        settings.tun_ip,
+        settings.tun_netmask
     );
-    tracing::info!("Local UDP Bind: {}", args.local_udp);
+    tracing::info!("Local UDP Bind: {}", settings.local_udp);
     for peer in &peers {
         tracing::info!(
             "Configured Peer: allowed_ip={}, pubkey={}, endpoint={:?}",
@@ -485,15 +576,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, peers)));
 
     let dev = DeviceBuilder::new()
-        .name(&args.tun_name)
+        .name(&settings.tun_name)
         .mtu(1411) // 1420 - 9 bytes AraxMesh overhead (1 byte type + 8 bytes nonce)
-        .ipv4(tun_ip.clone(), args.tun_netmask.clone(), None)
+        .ipv4(settings.tun_ip.clone(), settings.tun_netmask.clone(), None)
         .build_async()?;
 
     tracing::info!("Successfully created TUN interface: {}", dev.name()?);
 
-    let sock = Arc::new(UdpSocket::bind(args.local_udp).await?);
-    tracing::info!("Successfully bound UDP socket to {}", args.local_udp);
+    let sock = Arc::new(UdpSocket::bind(settings.local_udp).await?);
+    tracing::info!("Successfully bound UDP socket to {}", settings.local_udp);
 
     let dev_tx = Arc::new(dev);
     let dev_rx = dev_tx.clone();
@@ -916,5 +1007,57 @@ mod tests {
     fn parse_peer_arg_rejects_bad_allowed_ip() {
         let s = format!("{};192.168.1.5:50002;not-an-ip", valid_pubkey_hex());
         assert!(parse_peer_arg(&s).is_err());
+    }
+
+    #[test]
+    fn file_config_parses_full_toml() {
+        let pk = valid_pubkey_hex();
+        let toml = format!(
+            r#"
+            private_key = "{pk}"
+            tun_ip = "10.0.99.1"
+            tun_name = "arax9"
+            local_udp = "0.0.0.0:50001"
+
+            [[peer]]
+            public_key = "{pk}"
+            endpoint = "192.168.1.5:50002"
+            allowed_ip = "10.0.99.2"
+
+            [[peer]]
+            public_key = "{pk}"
+            allowed_ip = "10.0.99.3"
+            "#
+        );
+        let cfg: FileConfig = toml::from_str(&toml).expect("valid config");
+        assert_eq!(cfg.tun_name, "arax9");
+        assert_eq!(cfg.tun_netmask, "255.255.255.0"); // default applied
+        assert_eq!(cfg.peer.len(), 2);
+        // Specs feed the same validator as the CLI; both must parse cleanly.
+        for p in &cfg.peer {
+            parse_peer_arg(&p.to_spec()).expect("config peer spec parses");
+        }
+        // Inbound-only peer (no endpoint) renders with an empty middle field.
+        assert_eq!(cfg.peer[1].to_spec(), format!("{pk};;10.0.99.3"));
+    }
+
+    #[test]
+    fn file_config_applies_defaults() {
+        let toml = format!(
+            "private_key = \"{}\"\ntun_ip = \"10.0.99.1\"\n",
+            valid_pubkey_hex()
+        );
+        let cfg: FileConfig = toml::from_str(&toml).expect("minimal config");
+        assert_eq!(cfg.tun_name, "arax0");
+        assert_eq!(cfg.tun_netmask, "255.255.255.0");
+        assert_eq!(cfg.local_udp, "0.0.0.0:50001");
+        assert!(cfg.peer.is_empty());
+    }
+
+    #[test]
+    fn file_config_rejects_missing_required_field() {
+        // No private_key -> deserialization must fail.
+        let toml = "tun_ip = \"10.0.99.1\"\n";
+        assert!(toml::from_str::<FileConfig>(toml).is_err());
     }
 }
