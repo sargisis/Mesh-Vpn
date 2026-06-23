@@ -39,7 +39,7 @@ sudo ./target/debug/araxmesh \
 
 ## Architecture
 
-Everything currently lives in `src/main.rs`. The daemon is a single Tokio process running three concurrent tasks coordinated through one `Arc<Mutex<PeerManager>>`. `tokio::select!` exits the process when any task finishes.
+The code is split into a small library (`src/lib.rs`) plus a thin binary (`src/main.rs`) that just calls `araxmesh::run()`. Library modules: `daemon` (peer/session state — `Peer`, `ActiveSession`, `PeerManager` — and the runtime loop, including `run()`), `config` (CLI `Args`, TOML `FileConfig`, `resolve_settings`, `parse_peer_arg`), `packet` (`parse_ipv4_header`), and `types` (`PeerDescriptor`, shared with the future coordinator). The daemon is a single Tokio process running three concurrent tasks coordinated through one `Arc<Mutex<PeerManager>>`. `tokio::select!` exits the process when any task finishes.
 
 The three tasks:
 1. **tun_to_udp** — reads IP packets from the TUN device, looks up the peer whose `allowed_ip` matches the packet's destination IP (cryptokey routing), encrypts, sends over UDP. If no session exists, it kicks off a handshake.
