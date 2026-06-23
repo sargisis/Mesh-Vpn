@@ -15,11 +15,97 @@ use tun_rs::DeviceBuilder;
 use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
 
 
+/// Sliding-window anti-replay filter (RFC 6479 / WireGuard style).
+///
+/// Each session carries one of these on the RX side. A nonce is accepted at most
+/// once: duplicates and nonces older than the window are rejected. The window only
+/// advances on *authenticated* packets — `check_and_update` is called after the AEAD
+/// verifies, so a forged packet can never poison the window and starve real traffic.
+struct ReplayWindow {
+    /// Bitmap over the last `WINDOW_BITS` nonces, indexed `nonce % WINDOW_BITS`.
+    bitmap: [u64; Self::BITMAP_WORDS],
+    /// Highest nonce accepted so far.
+    last: u64,
+    /// False until the first packet is accepted (so nonce 0 is valid).
+    initialized: bool,
+}
+
+impl ReplayWindow {
+    const WINDOW_BITS: u64 = 1024;
+    const BITMAP_WORDS: usize = (Self::WINDOW_BITS / 64) as usize;
+
+    fn new() -> Self {
+        Self {
+            bitmap: [0; Self::BITMAP_WORDS],
+            last: 0,
+            initialized: false,
+        }
+    }
+
+    fn slot(nonce: u64) -> (usize, u64) {
+        let bit = nonce % Self::WINDOW_BITS;
+        ((bit / 64) as usize, bit % 64)
+    }
+
+    fn get_bit(&self, nonce: u64) -> bool {
+        let (word, bit) = Self::slot(nonce);
+        (self.bitmap[word] >> bit) & 1 == 1
+    }
+
+    fn set_bit(&mut self, nonce: u64) {
+        let (word, bit) = Self::slot(nonce);
+        self.bitmap[word] |= 1u64 << bit;
+    }
+
+    fn clear_bit(&mut self, nonce: u64) {
+        let (word, bit) = Self::slot(nonce);
+        self.bitmap[word] &= !(1u64 << bit);
+    }
+
+    /// Returns true if `nonce` has not been seen and is within the window, recording
+    /// it as seen. Returns false for duplicates and for nonces too old to track.
+    fn check_and_update(&mut self, nonce: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.last = nonce;
+            self.set_bit(nonce);
+            return true;
+        }
+
+        if nonce > self.last {
+            // Newer than anything seen: advance the window, clearing the slots that
+            // are newly exposed so stale bits from `WINDOW_BITS` ago don't linger.
+            let shift = nonce - self.last;
+            if shift >= Self::WINDOW_BITS {
+                self.bitmap = [0; Self::BITMAP_WORDS];
+            } else {
+                for n in (self.last + 1)..=nonce {
+                    self.clear_bit(n);
+                }
+            }
+            self.last = nonce;
+            self.set_bit(nonce);
+            true
+        } else {
+            // Within or below the window.
+            if self.last - nonce >= Self::WINDOW_BITS {
+                return false; // too old to tell — reject
+            }
+            if self.get_bit(nonce) {
+                return false; // already seen — replay
+            }
+            self.set_bit(nonce);
+            true
+        }
+    }
+}
+
 struct ActiveSession {
     state: StatelessTransportState,
     tx_nonce: u64,
     established_at: Instant,
     tx_bytes: u64,
+    replay: ReplayWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +257,7 @@ impl Peer {
                                             tx_nonce: 0,
                                             established_at: Instant::now(),
                                             tx_bytes: 0,
+                                            replay: ReplayWindow::new(),
                                         });
                                         self.last_rx = Instant::now();
                                         self.last_tx = Instant::now();
@@ -226,6 +313,7 @@ impl Peer {
                                 tx_nonce: 0,
                                 established_at: Instant::now(),
                                 tx_bytes: 0,
+                                replay: ReplayWindow::new(),
                             });
 
                             self.handshake = None;
@@ -289,18 +377,29 @@ impl Peer {
         }
         let mut plaintext = vec![0u8; ciphertext.len() - 16];
 
-        if let Some(active) = &self.active
+        // Authenticate FIRST, then enforce anti-replay. The window is advanced only
+        // on packets whose AEAD verifies, so a forged packet can never poison it and
+        // cause real traffic to be dropped as "old".
+        if let Some(active) = self.active.as_mut()
             && let Ok(len) = active.state.read_message(nonce, ciphertext, &mut plaintext)
         {
+            if !active.replay.check_and_update(nonce) {
+                tracing::debug!("Dropping replayed/too-old packet, nonce {}", nonce);
+                return None;
+            }
             plaintext.truncate(len);
             self.last_rx = Instant::now();
             return Some(plaintext);
         }
 
-        if let Some(prev) = &self.previous
+        if let Some(prev) = self.previous.as_mut()
             && prev.established_at.elapsed().as_secs() < 15
             && let Ok(len) = prev.state.read_message(nonce, ciphertext, &mut plaintext)
         {
+            if !prev.replay.check_and_update(nonce) {
+                tracing::debug!("Dropping replayed/too-old packet, nonce {} (previous session)", nonce);
+                return None;
+            }
             plaintext.truncate(len);
             self.last_rx = Instant::now();
             return Some(plaintext);
@@ -777,6 +876,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                     tx_nonce: 0,
                                                     established_at: Instant::now(),
                                                     tx_bytes: 0,
+                                                    replay: ReplayWindow::new(),
                                                 });
                                                 peer.last_rx = Instant::now();
                                                 peer.last_tx = Instant::now();
@@ -1080,6 +1180,7 @@ async fn process_relayed_packet(
                                     tx_nonce: 0,
                                     established_at: Instant::now(),
                                     tx_bytes: 0,
+                                    replay: ReplayWindow::new(),
                                 });
                                 peer.last_rx = Instant::now();
                                 peer.last_tx = Instant::now();
@@ -1460,6 +1561,106 @@ mod tests {
         let peer_b_no_c = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
         let pm_no_c = PeerManager::new(vec![0x00; 32], vec![peer_a_no_c, peer_b_no_c]);
         assert!(pm_no_c.find_best_peer_idx("8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    // --- Gate 6.0: anti-replay -------------------------------------------------
+
+    /// Run an NN Noise handshake (no static keys needed for a transport-layer test)
+    /// and return the two ends in stateless transport mode.
+    fn make_transport_pair() -> (StatelessTransportState, StatelessTransportState) {
+        let mut initiator = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+            .build_initiator()
+            .unwrap();
+        let mut responder = Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+            .build_responder()
+            .unwrap();
+
+        let mut buf = [0u8; 1024];
+        let mut buf2 = [0u8; 1024];
+
+        let len = initiator.write_message(&[], &mut buf).unwrap();
+        responder.read_message(&buf[..len], &mut buf2).unwrap();
+
+        let len = responder.write_message(&[], &mut buf2).unwrap();
+        initiator.read_message(&buf2[..len], &mut buf).unwrap();
+
+        (
+            initiator.into_stateless_transport_mode().unwrap(),
+            responder.into_stateless_transport_mode().unwrap(),
+        )
+    }
+
+    fn session(state: StatelessTransportState) -> ActiveSession {
+        ActiveSession {
+            state,
+            tx_nonce: 0,
+            established_at: Instant::now(),
+            tx_bytes: 0,
+            replay: ReplayWindow::new(),
+        }
+    }
+
+    #[test]
+    fn replay_window_accepts_in_order_rejects_duplicates_and_old() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_update(0), "first nonce accepted");
+        assert!(!w.check_and_update(0), "duplicate of 0 rejected");
+        assert!(w.check_and_update(1));
+        assert!(w.check_and_update(5), "jump forward accepted");
+        assert!(w.check_and_update(4), "in-window, unseen accepted");
+        assert!(!w.check_and_update(5), "duplicate of 5 rejected");
+
+        // Advance far past the window; the whole bitmap clears.
+        assert!(w.check_and_update(5000));
+        assert!(!w.check_and_update(1), "nonce far behind the window is too old");
+        assert!(w.check_and_update(5000 - 10), "still inside the window");
+    }
+
+    /// The core Gate 6.0 guarantee: a captured-and-resent valid packet is rejected.
+    #[test]
+    fn replayed_data_packet_is_rejected() {
+        let (init_ts, resp_ts) = make_transport_pair();
+        let mut sender = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.1/32".parse().unwrap()]);
+        sender.active = Some(session(init_ts));
+        let mut receiver = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.2/32".parse().unwrap()]);
+        receiver.active = Some(session(resp_ts));
+
+        let plaintext = b"hello araxmesh";
+        let wire = sender.encrypt_packet(plaintext).expect("encrypt");
+        assert_eq!(wire[0], 0x03, "transport-data type byte");
+        let payload = &wire[1..]; // strip type byte, as the udp_to_tun dispatch does
+
+        let first = receiver.decrypt_packet(payload).expect("first delivery decrypts");
+        assert_eq!(first, plaintext);
+
+        // Replaying the identical wire bytes must be dropped by the anti-replay window.
+        assert!(
+            receiver.decrypt_packet(payload).is_none(),
+            "replayed packet must be rejected"
+        );
+    }
+
+    #[test]
+    fn reordered_packets_within_window_are_accepted_once() {
+        let (init_ts, resp_ts) = make_transport_pair();
+        let mut sender = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.1/32".parse().unwrap()]);
+        sender.active = Some(session(init_ts));
+        let mut receiver = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.2/32".parse().unwrap()]);
+        receiver.active = Some(session(resp_ts));
+
+        // Encrypt three packets (nonces 0, 1, 2).
+        let p0 = sender.encrypt_packet(b"zero").unwrap();
+        let p1 = sender.encrypt_packet(b"one").unwrap();
+        let p2 = sender.encrypt_packet(b"two").unwrap();
+
+        // Deliver out of order: 2, 0, 1 — each accepted exactly once.
+        assert!(receiver.decrypt_packet(&p2[1..]).is_some());
+        assert!(receiver.decrypt_packet(&p0[1..]).is_some());
+        assert!(receiver.decrypt_packet(&p1[1..]).is_some());
+
+        // Re-delivering any of them is a replay.
+        assert!(receiver.decrypt_packet(&p1[1..]).is_none());
+        assert!(receiver.decrypt_packet(&p2[1..]).is_none());
     }
 }
 
