@@ -1,0 +1,27 @@
+# AraxMesh device config file.
+#
+# Run with:  sudo ./target/debug/araxmesh --config node.toml
+# Generate the keys with:  ./target/debug/araxmesh --gen-keys
+#
+# This file fully describes one node: its own private key, TUN settings, and
+# the peer table. It replaces the repeated --peer / --private-key CLI flags
+# (those still work when --config is not given).
+
+private_key = "<this node's 64-hex-char Noise private key>"
+tun_ip      = "10.0.99.1"
+
+# Optional — shown with their defaults:
+tun_name    = "arax0"
+tun_netmask = "255.255.255.0"
+local_udp   = "0.0.0.0:50001"
+
+# One [[peer]] block per remote node.
+[[peer]]
+public_key = "<peer's 64-hex-char Noise public key>"
+endpoint   = "192.168.1.5:50002"   # the peer's reachable UDP address
+allowed_ip = "10.0.99.2"           # the peer's overlay IP (cryptokey routing)
+
+[[peer]]
+public_key = "<another peer's public key>"
+# endpoint omitted: this peer only ever connects inbound (we never dial it).
+allowed_ip = "10.0.99.3"
