@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets
+
+      - name: Build
+        run: cargo build --verbose
+
+# Note: the end-to-end test_mesh.sh integration test is intentionally NOT run
+# here. It requires root, network namespaces and a TUN device (CAP_NET_ADMIN),
+# which the default hosted runners do not provide reliably. Run it locally with
+# `sudo ./test_mesh.sh` to validate the Phase 2 multi-peer gate.

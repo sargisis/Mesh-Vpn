@@ -263,32 +263,31 @@ impl Peer {
         }
         let mut plaintext = vec![0u8; ciphertext.len() - 16];
 
-        if let Some(active) = &self.active {
-            if let Ok(len) = active.state.read_message(nonce, ciphertext, &mut plaintext) {
-                plaintext.truncate(len);
-                self.last_rx = Instant::now();
-                return Some(plaintext);
-            }
+        if let Some(active) = &self.active
+            && let Ok(len) = active.state.read_message(nonce, ciphertext, &mut plaintext)
+        {
+            plaintext.truncate(len);
+            self.last_rx = Instant::now();
+            return Some(plaintext);
         }
 
-        if let Some(prev) = &self.previous {
-            if prev.established_at.elapsed().as_secs() < 15 {
-                if let Ok(len) = prev.state.read_message(nonce, ciphertext, &mut plaintext) {
-                    plaintext.truncate(len);
-                    self.last_rx = Instant::now();
-                    return Some(plaintext);
-                }
-            }
+        if let Some(prev) = &self.previous
+            && prev.established_at.elapsed().as_secs() < 15
+            && let Ok(len) = prev.state.read_message(nonce, ciphertext, &mut plaintext)
+        {
+            plaintext.truncate(len);
+            self.last_rx = Instant::now();
+            return Some(plaintext);
         }
 
         None
     }
 
     fn check_rotation(&mut self) -> bool {
-        if let Some(prev) = &self.previous {
-            if prev.established_at.elapsed().as_secs() >= 15 {
-                self.previous = None;
-            }
+        if let Some(prev) = &self.previous
+            && prev.established_at.elapsed().as_secs() >= 15
+        {
+            self.previous = None;
         }
 
         if let Some(active) = &self.active {
@@ -558,26 +557,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(packet) = peer.initiate_handshake(&local_priv) {
                             actions.push((packet, peer.endpoint));
                         }
-                    } else if let Some(attempt) = peer.last_handshake_attempt {
-                        if attempt.elapsed().as_secs() >= 2 {
-                            tracing::info!(
-                                "Handshake timeout for peer {}. Retransmitting...",
-                                hex::encode(&peer.pubkey)
-                            );
-                            peer.last_handshake_attempt = Some(Instant::now());
-                            if let Some(packet) = &peer.last_handshake_packet {
-                                actions.push((packet.clone(), peer.endpoint));
-                            }
+                    } else if let Some(attempt) = peer.last_handshake_attempt
+                        && attempt.elapsed().as_secs() >= 2
+                    {
+                        tracing::info!(
+                            "Handshake timeout for peer {}. Retransmitting...",
+                            hex::encode(&peer.pubkey)
+                        );
+                        peer.last_handshake_attempt = Some(Instant::now());
+                        if let Some(packet) = &peer.last_handshake_packet {
+                            actions.push((packet.clone(), peer.endpoint));
                         }
                     }
                 }
             }
 
             for (packet, endpoint) in actions {
-                if let Some(addr) = endpoint {
-                    if let Err(e) = sock_timer.send_to(&packet, addr).await {
-                        tracing::error!("Failed to send timer packet to {}: {:?}", addr, e);
-                    }
+                if let Some(addr) = endpoint
+                    && let Err(e) = sock_timer.send_to(&packet, addr).await
+                {
+                    tracing::error!("Failed to send timer packet to {}: {:?}", addr, e);
                 }
             }
         }
@@ -609,29 +608,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 if let Some(packet) = peer.encrypt_packet(packet_payload) {
                                     action = Some((packet, peer.endpoint));
-                                } else if peer.active.is_none() && peer.handshake.is_none() {
-                                    if let Some(hs_packet) = peer.initiate_handshake(&local_priv) {
-                                        tracing::info!(
-                                            "Triggering handshake for peer {} at allowed IP {}",
-                                            hex::encode(&peer.pubkey),
-                                            peer.allowed_ip
-                                        );
-                                        action = Some((hs_packet, peer.endpoint));
-                                    }
+                                } else if peer.active.is_none()
+                                    && peer.handshake.is_none()
+                                    && let Some(hs_packet) = peer.initiate_handshake(&local_priv)
+                                {
+                                    tracing::info!(
+                                        "Triggering handshake for peer {} at allowed IP {}",
+                                        hex::encode(&peer.pubkey),
+                                        peer.allowed_ip
+                                    );
+                                    action = Some((hs_packet, peer.endpoint));
                                 }
                             } else {
                                 tracing::debug!("No routed peer for dst IP: {}", dst_ip);
                             }
                         }
 
-                        if let Some((packet, Some(endpoint))) = action {
-                            if let Err(e) = sock_tx.send_to(&packet, endpoint).await {
-                                tracing::error!(
-                                    "Failed to send UDP packet to peer {}: {:?}",
-                                    endpoint,
-                                    e
-                                );
-                            }
+                        if let Some((packet, Some(endpoint))) = action
+                            && let Err(e) = sock_tx.send_to(&packet, endpoint).await
+                        {
+                            tracing::error!(
+                                "Failed to send UDP packet to peer {}: {:?}",
+                                endpoint,
+                                e
+                            );
                         }
                     }
                 }
@@ -669,63 +669,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if let Ok(mut hs) = builder.build_responder() {
                                 let mut read_buf = vec![0u8; 128];
-                                if hs.read_message(payload, &mut read_buf).is_ok() {
-                                    if let Some(remote_static_ref) = hs.get_remote_static() {
-                                        let remote_static = remote_static_ref.to_vec();
-                                        if let Some(peer) = manager
-                                            .peers
-                                            .iter_mut()
-                                            .find(|p| p.pubkey == remote_static)
-                                        {
-                                            peer.endpoint = Some(addr);
+                                if hs.read_message(payload, &mut read_buf).is_ok()
+                                    && let Some(remote_static_ref) = hs.get_remote_static()
+                                {
+                                    let remote_static = remote_static_ref.to_vec();
+                                    if let Some(peer) =
+                                        manager.peers.iter_mut().find(|p| p.pubkey == remote_static)
+                                    {
+                                        peer.endpoint = Some(addr);
 
-                                            let mut resp_msg = vec![0u8; 128];
-                                            if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
-                                                resp_msg.truncate(len);
-                                                if let Ok(stateless_transport) =
-                                                    hs.into_stateless_transport_mode()
-                                                {
-                                                    tracing::info!(
-                                                        "Handshake complete for peer {} (initiator). Transitioning to Transport mode.",
-                                                        hex::encode(remote_static)
-                                                    );
+                                        let mut resp_msg = vec![0u8; 128];
+                                        if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
+                                            resp_msg.truncate(len);
+                                            if let Ok(stateless_transport) =
+                                                hs.into_stateless_transport_mode()
+                                            {
+                                                tracing::info!(
+                                                    "Handshake complete for peer {} (initiator). Transitioning to Transport mode.",
+                                                    hex::encode(remote_static)
+                                                );
 
-                                                    if let Some(active) = peer.active.take() {
-                                                        peer.previous = Some(active);
-                                                    }
-
-                                                    peer.active = Some(ActiveSession {
-                                                        state: stateless_transport,
-                                                        tx_nonce: 0,
-                                                        established_at: Instant::now(),
-                                                        tx_bytes: 0,
-                                                    });
-                                                    peer.last_rx = Instant::now();
-                                                    peer.last_tx = Instant::now();
-
-                                                    let mut resp_packet =
-                                                        Vec::with_capacity(1 + len);
-                                                    resp_packet.push(0x02);
-                                                    resp_packet.extend_from_slice(&resp_msg);
-                                                    response_packet = Some(resp_packet);
+                                                if let Some(active) = peer.active.take() {
+                                                    peer.previous = Some(active);
                                                 }
+
+                                                peer.active = Some(ActiveSession {
+                                                    state: stateless_transport,
+                                                    tx_nonce: 0,
+                                                    established_at: Instant::now(),
+                                                    tx_bytes: 0,
+                                                });
+                                                peer.last_rx = Instant::now();
+                                                peer.last_tx = Instant::now();
+
+                                                let mut resp_packet = Vec::with_capacity(1 + len);
+                                                resp_packet.push(0x02);
+                                                resp_packet.extend_from_slice(&resp_msg);
+                                                response_packet = Some(resp_packet);
                                             }
-                                        } else {
-                                            tracing::warn!(
-                                                "Unauthorized remote static key in handshake initiation: {}",
-                                                hex::encode(remote_static)
-                                            );
                                         }
+                                    } else {
+                                        tracing::warn!(
+                                            "Unauthorized remote static key in handshake initiation: {}",
+                                            hex::encode(remote_static)
+                                        );
                                     }
                                 }
                             }
                             response_packet
                         };
 
-                        if let Some(resp_packet) = resp {
-                            if let Err(e) = sock_rx.send_to(&resp_packet, addr).await {
-                                tracing::error!("Failed to send handshake response: {:?}", e);
-                            }
+                        if let Some(resp_packet) = resp
+                            && let Err(e) = sock_rx.send_to(&resp_packet, addr).await
+                        {
+                            tracing::error!("Failed to send handshake response: {:?}", e);
                         }
                     } else if packet_type == 0x02 {
                         {
@@ -750,42 +747,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // 1. Try by endpoint lookup
                             if let Some(peer) =
                                 manager.peers.iter_mut().find(|p| p.endpoint == Some(addr))
+                                && let Some(plaintext) = peer.decrypt_packet(payload)
+                                && let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext)
                             {
-                                if let Some(plaintext) = peer.decrypt_packet(payload) {
-                                    if let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext) {
-                                        if src_ip == peer.allowed_ip {
-                                            result = Some(plaintext);
-                                        } else {
-                                            tracing::warn!(
-                                                "Cryptokey routing check failed: src_ip {} does not match peer's allowed IP {}",
-                                                src_ip,
-                                                peer.allowed_ip
-                                            );
-                                        }
-                                    }
+                                if src_ip == peer.allowed_ip {
+                                    result = Some(plaintext);
+                                } else {
+                                    tracing::warn!(
+                                        "Cryptokey routing check failed: src_ip {} does not match peer's allowed IP {}",
+                                        src_ip,
+                                        peer.allowed_ip
+                                    );
                                 }
                             }
 
                             // 2. Try trial decryption fallback
                             if result.is_none() {
                                 for peer in manager.peers.iter_mut() {
-                                    if peer.endpoint != Some(addr) {
-                                        if let Some(plaintext) = peer.decrypt_packet(payload) {
-                                            if let Some((src_ip, _dst_ip)) =
-                                                parse_ipv4_header(&plaintext)
-                                            {
-                                                if src_ip == peer.allowed_ip {
-                                                    tracing::info!(
-                                                        "Peer {} roamed to new endpoint: {}",
-                                                        hex::encode(&peer.pubkey),
-                                                        addr
-                                                    );
-                                                    peer.endpoint = Some(addr);
-                                                    result = Some(plaintext);
-                                                    break;
-                                                }
-                                            }
-                                        }
+                                    if peer.endpoint != Some(addr)
+                                        && let Some(plaintext) = peer.decrypt_packet(payload)
+                                        && let Some((src_ip, _dst_ip)) =
+                                            parse_ipv4_header(&plaintext)
+                                        && src_ip == peer.allowed_ip
+                                    {
+                                        tracing::info!(
+                                            "Peer {} roamed to new endpoint: {}",
+                                            hex::encode(&peer.pubkey),
+                                            addr
+                                        );
+                                        peer.endpoint = Some(addr);
+                                        result = Some(plaintext);
+                                        break;
                                     }
                                 }
                             }
@@ -834,4 +826,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    // A 64-hex-char (32-byte) public key, all bytes 0xab.
+    fn valid_pubkey_hex() -> String {
+        "ab".repeat(32)
+    }
+
+    // Minimal 20-byte IPv4 header with the given version/IHL byte and addrs.
+    fn make_ipv4(version_ihl: u8, src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = version_ihl;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    #[test]
+    fn parse_ipv4_header_extracts_src_and_dst() {
+        let pkt = make_ipv4(0x45, [10, 0, 99, 1], [10, 0, 99, 2]);
+        let (src, dst) = parse_ipv4_header(&pkt).expect("valid IPv4 header");
+        assert_eq!(src, Ipv4Addr::new(10, 0, 99, 1));
+        assert_eq!(dst, Ipv4Addr::new(10, 0, 99, 2));
+    }
+
+    #[test]
+    fn parse_ipv4_header_rejects_short_packet() {
+        assert!(parse_ipv4_header(&[0u8; 19]).is_none());
+        assert!(parse_ipv4_header(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_ipv4_header_rejects_non_ipv4_version() {
+        // 0x60 => version 6: cryptokey routing only handles IPv4 here.
+        let pkt = make_ipv4(0x60, [10, 0, 99, 1], [10, 0, 99, 2]);
+        assert!(parse_ipv4_header(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_peer_arg_full_form() {
+        let s = format!("{};192.168.1.5:50002;10.0.99.2", valid_pubkey_hex());
+        let p = parse_peer_arg(&s).expect("valid peer");
+        assert_eq!(p.pubkey, vec![0xab; 32]);
+        assert_eq!(p.endpoint, Some("192.168.1.5:50002".parse().unwrap()));
+        assert_eq!(p.allowed_ip, Ipv4Addr::new(10, 0, 99, 2));
+    }
+
+    #[test]
+    fn parse_peer_arg_empty_endpoint_is_inbound_only() {
+        // Empty middle field => peer that only ever connects inbound.
+        let s = format!("{};;10.0.99.2", valid_pubkey_hex());
+        let p = parse_peer_arg(&s).expect("valid inbound-only peer");
+        assert!(p.endpoint.is_none());
+        assert_eq!(p.allowed_ip, Ipv4Addr::new(10, 0, 99, 2));
+    }
+
+    #[test]
+    fn parse_peer_arg_rejects_wrong_field_count() {
+        assert!(parse_peer_arg("only;two").is_err());
+        let s = format!("{};192.168.1.5:50002;10.0.99.2;extra", valid_pubkey_hex());
+        assert!(parse_peer_arg(&s).is_err());
+    }
+
+    #[test]
+    fn parse_peer_arg_rejects_bad_pubkey_hex() {
+        let s = format!("{};192.168.1.5:50002;10.0.99.2", "zz".repeat(32));
+        assert!(parse_peer_arg(&s).is_err());
+    }
+
+    #[test]
+    fn parse_peer_arg_rejects_wrong_pubkey_length() {
+        // 30 bytes of valid hex, but the key must be exactly 32.
+        let s = format!("{};192.168.1.5:50002;10.0.99.2", "ab".repeat(30));
+        assert!(parse_peer_arg(&s).is_err());
+    }
+
+    #[test]
+    fn parse_peer_arg_rejects_bad_endpoint() {
+        let s = format!("{};not-an-endpoint;10.0.99.2", valid_pubkey_hex());
+        assert!(parse_peer_arg(&s).is_err());
+    }
+
+    #[test]
+    fn parse_peer_arg_rejects_bad_allowed_ip() {
+        let s = format!("{};192.168.1.5:50002;not-an-ip", valid_pubkey_hex());
+        assert!(parse_peer_arg(&s).is_err());
+    }
 }
