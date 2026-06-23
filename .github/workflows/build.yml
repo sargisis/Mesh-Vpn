@@ -73,7 +73,7 @@ jobs:
           # Initialize iOS project configs in non-interactive mode
           npx tauri ios init
           # Compile the iOS target (unsigned build for sideloading)
-          npx tauri ios build --no-bundle
+          npx tauri ios build -- CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS=""
           # Package the generated build directories for easy download
           zip -r AraxMesh_iOS_Build.zip src-tauri/gen/apple
 
