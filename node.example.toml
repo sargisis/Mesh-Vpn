@@ -35,9 +35,11 @@ tun_ip = "10.0.99.1"
 [[peer]]
 public_key = "<peer's 64-hex-char Noise public key>"
 endpoint   = "192.168.1.5:50002"   # the peer's reachable UDP address
-allowed_ip = "10.0.99.2"           # the peer's overlay IP (cryptokey routing)
+# allowed_ip can be a single host IP, a CIDR range, or a comma-separated list.
+# For example, to route peer traffic, a home subnet, and make it an exit node:
+allowed_ip = "10.0.99.2,192.168.1.0/24,0.0.0.0/0"
 
 [[peer]]
 public_key = "<another peer's public key>"
 # endpoint omitted: this peer only ever connects inbound (we never dial it).
-allowed_ip = "10.0.99.3"
+allowed_ip = "10.0.99.3/32"

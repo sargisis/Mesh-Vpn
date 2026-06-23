@@ -31,7 +31,7 @@ enum OutboundDest {
 struct Peer {
     pubkey: Vec<u8>,
     endpoint: Option<SocketAddr>,
-    allowed_ip: std::net::Ipv4Addr,
+    allowed_ips: Vec<crate::packet::Ipv4Subnet>,
 
     active: Option<ActiveSession>,
     previous: Option<ActiveSession>,
@@ -45,11 +45,11 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(pubkey: Vec<u8>, endpoint: Option<SocketAddr>, allowed_ip: std::net::Ipv4Addr) -> Self {
+    fn new(pubkey: Vec<u8>, endpoint: Option<SocketAddr>, allowed_ips: Vec<crate::packet::Ipv4Subnet>) -> Self {
         Self {
             pubkey,
             endpoint,
-            allowed_ip,
+            allowed_ips,
             active: None,
             previous: None,
             handshake: None,
@@ -364,19 +364,37 @@ impl PeerManager {
         for w in wanted {
             if let Some(existing) = self.peers.iter_mut().find(|p| p.pubkey == w.pubkey) {
                 existing.endpoint = w.endpoint;
-                existing.allowed_ip = w.allowed_ip;
+                existing.allowed_ips = w.allowed_ips;
             } else {
                 if let Some(ep) = w.endpoint {
                     new_endpoints.push(ep);
                     self.peers
-                        .push(Peer::new(w.pubkey, Some(ep), w.allowed_ip));
+                        .push(Peer::new(w.pubkey, Some(ep), w.allowed_ips.clone()));
                 } else {
                     self.peers
-                        .push(Peer::new(w.pubkey, None, w.allowed_ip));
+                        .push(Peer::new(w.pubkey, None, w.allowed_ips.clone()));
                 }
             }
         }
         new_endpoints
+    }
+
+    fn find_best_peer_idx(&self, dst_ip: std::net::Ipv4Addr) -> Option<usize> {
+        let mut matched_peer_idx = None;
+        let mut best_prefix_len = -1i32;
+
+        for (idx, peer) in self.peers.iter().enumerate() {
+            for subnet in &peer.allowed_ips {
+                if subnet.contains(dst_ip) {
+                    let len = subnet.prefix_len as i32;
+                    if len > best_prefix_len {
+                        best_prefix_len = len;
+                        matched_peer_idx = Some(idx);
+                    }
+                }
+            }
+        }
+        matched_peer_idx
     }
 }
 
@@ -454,7 +472,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         for p_desc in reg_resp.peers {
             match parse_peer_arg(&p_desc.to_spec()) {
                 Ok(parsed) => {
-                    parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
+                    parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ips));
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse peer from coordinator: {}", e);
@@ -466,7 +484,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut parsed_peers = Vec::new();
         for p_str in &settings.peer_specs {
             let parsed = parse_peer_arg(p_str)?;
-            parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ip));
+            parsed_peers.push(Peer::new(parsed.pubkey, parsed.endpoint, parsed.allowed_ips));
         }
 
         if parsed_peers.is_empty() {
@@ -491,9 +509,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!("Local UDP Bind: {}", settings.local_udp);
     for peer in &peers {
+        let allowed_ips_str = peer.allowed_ips.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         tracing::info!(
-            "Configured Peer: allowed_ip={}, pubkey={}, endpoint={:?}",
-            peer.allowed_ip,
+            "Configured Peer: allowed_ips={}, pubkey={}, endpoint={:?}",
+            allowed_ips_str,
             hex::encode(&peer.pubkey),
             peer.endpoint
         );
@@ -641,9 +663,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let mut manager = pm_tx.lock().unwrap();
                             let local_priv = manager.local_priv.clone();
 
-                            if let Some(peer) =
-                                manager.peers.iter_mut().find(|p| p.allowed_ip == dst_ip)
-                            {
+                            let matched_peer_idx = manager.find_best_peer_idx(dst_ip);
+
+                            if let Some(idx) = matched_peer_idx {
+                                let peer = &mut manager.peers[idx];
                                 if let Some(packet) = peer.encrypt_packet(packet_payload) {
                                     if let Some(dest) = peer.determine_dest(has_relay) {
                                         action = Some((packet, dest));
@@ -652,10 +675,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     && peer.handshake.is_none()
                                     && let Some(hs_packet) = peer.initiate_handshake(&local_priv)
                                 {
+                                    let allowed_ips_str = peer.allowed_ips.iter()
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",");
                                     tracing::info!(
-                                        "Triggering handshake for peer {} at allowed IP {}",
+                                        "Triggering handshake for peer {} at allowed IPs {}",
                                         hex::encode(&peer.pubkey),
-                                        peer.allowed_ip
+                                        allowed_ips_str
                                     );
                                     if let Some(dest) = peer.determine_dest(has_relay) {
                                         action = Some((hs_packet, dest));
@@ -803,14 +830,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 && let Some(plaintext) = peer.decrypt_packet(payload)
                                 && let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext)
                             {
-                                if src_ip == peer.allowed_ip {
+                                if peer.allowed_ips.iter().any(|s| s.contains(src_ip)) {
                                     peer.last_direct_rx = Instant::now();
                                     result = Some(plaintext);
                                 } else {
+                                    let allowed_ips_str = peer.allowed_ips.iter()
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",");
                                     tracing::warn!(
-                                        "Cryptokey routing check failed: src_ip {} does not match peer's allowed IP {}",
+                                        "Cryptokey routing check failed: src_ip {} does not match peer's allowed IPs {}",
                                         src_ip,
-                                        peer.allowed_ip
+                                        allowed_ips_str
                                     );
                                 }
                             }
@@ -822,7 +853,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         && let Some(plaintext) = peer.decrypt_packet(payload)
                                         && let Some((src_ip, _dst_ip)) =
                                             parse_ipv4_header(&plaintext)
-                                        && src_ip == peer.allowed_ip
+                                        && peer.allowed_ips.iter().any(|s| s.contains(src_ip))
                                     {
                                         tracing::info!(
                                             "Peer {} roamed to new endpoint: {}",
@@ -1080,7 +1111,7 @@ async fn process_relayed_packet(
             if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key) {
                 if let Some(plaintext) = peer.decrypt_packet(payload) {
                     if let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext) {
-                        if src_ip == peer.allowed_ip {
+                        if peer.allowed_ips.iter().any(|s| s.contains(src_ip)) {
                             result = Some(plaintext);
                         } else {
                             tracing::warn!("Cryptokey routing check failed for relayed packet");
@@ -1261,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_determine_dest_no_relay() {
-        let peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), "10.0.99.2".parse().unwrap());
+        let peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), vec!["10.0.99.2".parse().unwrap()]);
 
         // If has_relay is false, and endpoint is Some, it should return Udp(endpoint).
         let dest = peer.determine_dest(false);
@@ -1271,14 +1302,14 @@ mod tests {
         }
 
         // If has_relay is false, and endpoint is None, it should return None.
-        let peer_no_ep = Peer::new(vec![0xbb; 32], None, "10.0.99.2".parse().unwrap());
+        let peer_no_ep = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.2".parse().unwrap()]);
         let dest_no_ep = peer_no_ep.determine_dest(false);
         assert!(dest_no_ep.is_none());
     }
 
     #[test]
     fn test_determine_dest_with_relay_fallback() {
-        let mut peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), "10.0.99.2".parse().unwrap());
+        let mut peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), vec!["10.0.99.2".parse().unwrap()]);
 
         // Initially last_direct_rx is Instant::now(), so last_direct_rx.elapsed() < 10.
         // It should use direct UDP.
@@ -1294,7 +1325,7 @@ mod tests {
         }
 
         // If endpoint is None, it should always use Relay (if has_relay is true).
-        let peer_no_ep = Peer::new(vec![0xbb; 32], None, "10.0.99.2".parse().unwrap());
+        let peer_no_ep = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.2".parse().unwrap()]);
         let dest_no_ep = peer_no_ep.determine_dest(true);
         assert!(matches!(dest_no_ep, Some(OutboundDest::Relay(_))));
     }
@@ -1360,7 +1391,7 @@ mod tests {
         let peer_pubkey = vec![0xbb; 32];
 
         // We set last_direct_rx to 11s ago to simulate fallback.
-        let mut peer = Peer::new(peer_pubkey.clone(), None, "10.0.99.2".parse().unwrap());
+        let mut peer = Peer::new(peer_pubkey.clone(), None, vec!["10.0.99.2".parse().unwrap()]);
         peer.last_direct_rx = Instant::now() - std::time::Duration::from_secs(11);
 
         let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, vec![peer])));
@@ -1394,6 +1425,41 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].0, [0xbb; 32]);
         assert_eq!(packets[0].1, vec![0x03, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_longest_prefix_match() {
+        use std::net::Ipv4Addr;
+
+        // Peer A: 10.0.99.5/32 (specific host route)
+        // Peer B: 10.0.99.0/24 (general subnet route)
+        // Peer C: 0.0.0.0/0 (default exit node)
+        let peer_a = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.5/32".parse().unwrap()]);
+        let peer_b = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
+        let peer_c = Peer::new(vec![0xcc; 32], None, vec!["0.0.0.0/0".parse().unwrap()]);
+
+        let pm = PeerManager::new(vec![0x00; 32], vec![peer_a, peer_b, peer_c]);
+
+        // 1. Matches A (specific host wins over /24 and /0)
+        let ip_a: Ipv4Addr = "10.0.99.5".parse().unwrap();
+        let idx_a = pm.find_best_peer_idx(ip_a).unwrap();
+        assert_eq!(pm.peers[idx_a].pubkey, vec![0xaa; 32]);
+
+        // 2. Matches B (subnet wins over /0)
+        let ip_b: Ipv4Addr = "10.0.99.10".parse().unwrap();
+        let idx_b = pm.find_best_peer_idx(ip_b).unwrap();
+        assert_eq!(pm.peers[idx_b].pubkey, vec![0xbb; 32]);
+
+        // 3. Matches C (exit node wins for any other IP)
+        let ip_c: Ipv4Addr = "8.8.8.8".parse().unwrap();
+        let idx_c = pm.find_best_peer_idx(ip_c).unwrap();
+        assert_eq!(pm.peers[idx_c].pubkey, vec![0xcc; 32]);
+
+        // 4. If no exit node, and IP doesn't match subnets, returns None
+        let peer_a_no_c = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.5/32".parse().unwrap()]);
+        let peer_b_no_c = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
+        let pm_no_c = PeerManager::new(vec![0x00; 32], vec![peer_a_no_c, peer_b_no_c]);
+        assert!(pm_no_c.find_best_peer_idx("8.8.8.8".parse().unwrap()).is_none());
     }
 }
 

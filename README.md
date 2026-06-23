@@ -14,6 +14,7 @@
 - **Self-hosted coordinator (control plane)** — an HTTP/JSON service where nodes register, obtain overlay IPs, and discover peers dynamically.
 - **Dynamic peer synchronisation** — daemon polls the coordinator every 10 s and reconciles the peer table without restarting.
 - **TOML config file** — a single file describes an entire node (private key, TUN settings, peer table or coordinator URL).
+- **Subnet Routing & Exit Nodes (Phase 5)** — routes entire IPv4 subnets (e.g. `192.168.1.0/24`) and default exit routes (`0.0.0.0/0`) using Longest Prefix Match (LPM) routing where specific host routes (`/32`) override subnets, which override the default exit route.
 - **NAT Traversal (Phase 4)**:
   - **STUN-like discovery** — coordinator automatically detects real external IP/port via the TCP registration connection.
   - **UDP Hole Punching** — peers exchange hole-punching probes (`0x04` packets) to puncture local NAT state tables.
@@ -174,8 +175,8 @@ See [ROADMAP.md](ROADMAP.md) for the full phased plan.
 | 2 | Multi-peer routing, keepalive, key rotation | ✅ |
 | 3 | Self-hosted coordinator (control plane) | ✅ |
 | 4 | NAT traversal (STUN + hole punch + relay) | ✅ |
-| 5 | Exit-node mode, subnet routing, CLI UX | ⬜ |
-| 6 | Release, docs, independent audit plan | ⬜ |
+| 5 | Exit-node mode, subnet routing, CLI UX | ✅ |
+
 
 ---
 

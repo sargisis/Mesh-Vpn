@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 pub(crate) struct ParsedPeer {
     pub(crate) pubkey: Vec<u8>,
     pub(crate) endpoint: Option<SocketAddr>,
-    pub(crate) allowed_ip: std::net::Ipv4Addr,
+    pub(crate) allowed_ips: Vec<crate::packet::Ipv4Subnet>,
 }
 
 pub(crate) fn parse_peer_arg(s: &str) -> Result<ParsedPeer, Box<dyn std::error::Error>> {
@@ -44,14 +44,18 @@ pub(crate) fn parse_peer_arg(s: &str) -> Result<ParsedPeer, Box<dyn std::error::
         )
     };
 
-    let allowed_ip = allowed_ip_str
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|e| format!("Invalid allowed IP '{}': {}", allowed_ip_str, e))?;
+    let allowed_ips: Result<Vec<crate::packet::Ipv4Subnet>, _> = allowed_ip_str
+        .split(',')
+        .map(|part| part.trim().parse::<crate::packet::Ipv4Subnet>())
+        .collect();
+    let allowed_ips = allowed_ips.map_err(|e| {
+        format!("Invalid allowed IP(s) '{}': {}", allowed_ip_str, e)
+    })?;
 
     Ok(ParsedPeer {
         pubkey,
         endpoint,
-        allowed_ip,
+        allowed_ips,
     })
 }
 
@@ -256,7 +260,6 @@ pub(crate) fn parse_startup() -> Result<Startup, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     // A 64-hex-char (32-byte) public key, all bytes 0xab.
     fn valid_pubkey_hex() -> String {
@@ -269,7 +272,7 @@ mod tests {
         let p = parse_peer_arg(&s).expect("valid peer");
         assert_eq!(p.pubkey, vec![0xab; 32]);
         assert_eq!(p.endpoint, Some("192.168.1.5:50002".parse().unwrap()));
-        assert_eq!(p.allowed_ip, Ipv4Addr::new(10, 0, 99, 2));
+        assert_eq!(p.allowed_ips, vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]);
     }
 
     #[test]
@@ -278,7 +281,7 @@ mod tests {
         let s = format!("{};;10.0.99.2", valid_pubkey_hex());
         let p = parse_peer_arg(&s).expect("valid inbound-only peer");
         assert!(p.endpoint.is_none());
-        assert_eq!(p.allowed_ip, Ipv4Addr::new(10, 0, 99, 2));
+        assert_eq!(p.allowed_ips, vec!["10.0.99.2".parse::<crate::packet::Ipv4Subnet>().unwrap()]);
     }
 
     #[test]
