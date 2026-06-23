@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 /// Inspects an IPv4 packet header to extract source and destination IP addresses.
-pub(crate) fn parse_ipv4_header(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
+pub fn parse_ipv4_header(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     if packet.len() < 20 {
         return None;
     }

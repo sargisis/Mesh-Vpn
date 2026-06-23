@@ -6,7 +6,7 @@ pub mod control;
 pub mod coordinator;
 pub mod daemon;
 pub mod nat;
-mod packet;
+pub mod packet;
 pub mod relay;
 mod types;
 

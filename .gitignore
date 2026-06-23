@@ -2,3 +2,8 @@
 
 # graphify knowledge-graph output (generated, rebuildable via /graphify)
 /graphify-out
+
+# cargo-fuzz
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
