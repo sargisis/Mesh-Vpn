@@ -90,6 +90,22 @@ struct Args {
     /// TUN settings and peer table instead of the individual CLI flags.
     #[arg(long)]
     config: Option<std::path::PathBuf>,
+
+    /// URL of the control-plane coordinator (HTTP).
+    #[arg(long)]
+    coordinator_url: Option<String>,
+
+    /// Pre-auth key to register/poll the coordinator.
+    #[arg(long)]
+    auth_key: Option<String>,
+
+    /// Hostname to register with the coordinator.
+    #[arg(long)]
+    hostname: Option<String>,
+
+    /// Public UDP endpoint to advertise to the coordinator (e.g. 192.168.100.1:50000).
+    #[arg(long)]
+    public_endpoint: Option<String>,
 }
 
 /// Device configuration loaded from a TOML file (Phase 3 device config file).
@@ -98,7 +114,7 @@ struct Args {
 #[derive(serde::Deserialize, Debug)]
 struct FileConfig {
     private_key: String,
-    tun_ip: String,
+    tun_ip: Option<String>,
     #[serde(default = "default_tun_name")]
     tun_name: String,
     #[serde(default = "default_tun_netmask")]
@@ -107,6 +123,10 @@ struct FileConfig {
     local_udp: String,
     #[serde(default)]
     peer: Vec<PeerDescriptor>,
+    coordinator_url: Option<String>,
+    auth_key: Option<String>,
+    hostname: Option<String>,
+    public_endpoint: Option<String>,
 }
 
 fn default_tun_name() -> String {
@@ -123,11 +143,15 @@ fn default_local_udp() -> String {
 /// one shape. Peers are kept as CLI-style specs and parsed downstream.
 pub(crate) struct DaemonSettings {
     pub(crate) tun_name: String,
-    pub(crate) tun_ip: String,
+    pub(crate) tun_ip: Option<String>,
     pub(crate) tun_netmask: String,
     pub(crate) local_udp: SocketAddr,
     pub(crate) private_key_hex: String,
     pub(crate) peer_specs: Vec<String>,
+    pub(crate) coordinator_url: Option<String>,
+    pub(crate) auth_key: Option<String>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) public_endpoint: Option<String>,
 }
 
 /// Resolve settings from `--config <file>` if given, otherwise from the CLI
@@ -142,6 +166,11 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             .local_udp
             .parse::<SocketAddr>()
             .map_err(|e| format!("Invalid local_udp '{}' in config: {}", cfg.local_udp, e))?;
+
+        if cfg.coordinator_url.is_none() && cfg.tun_ip.is_none() {
+            return Err("Missing required field in config: tun_ip (or use coordinator_url)".into());
+        }
+
         Ok(DaemonSettings {
             tun_name: cfg.tun_name,
             tun_ip: cfg.tun_ip,
@@ -149,12 +178,20 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             local_udp,
             private_key_hex: cfg.private_key,
             peer_specs: cfg.peer.iter().map(PeerDescriptor::to_spec).collect(),
+            coordinator_url: cfg.coordinator_url,
+            auth_key: cfg.auth_key,
+            hostname: cfg.hostname,
+            public_endpoint: cfg.public_endpoint,
         })
     } else {
-        let tun_ip = args
-            .tun_ip
-            .clone()
-            .ok_or_else(|| "Missing required argument: --tun-ip (or use --config)".to_string())?;
+        let coordinator_url = args.coordinator_url.clone();
+        let tun_ip = if coordinator_url.is_none() {
+            Some(args.tun_ip.clone().ok_or_else(|| {
+                "Missing required argument: --tun-ip (or use --config or --coordinator-url)".to_string()
+            })?)
+        } else {
+            args.tun_ip.clone()
+        };
         let private_key_hex = args.private_key.clone().ok_or_else(|| {
             "Missing required argument: --private-key (or use --config)".to_string()
         })?;
@@ -165,6 +202,10 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             local_udp: args.local_udp,
             private_key_hex,
             peer_specs: args.peer.clone(),
+            coordinator_url: args.coordinator_url.clone(),
+            auth_key: args.auth_key.clone(),
+            hostname: args.hostname.clone(),
+            public_endpoint: args.public_endpoint.clone(),
         })
     }
 }
