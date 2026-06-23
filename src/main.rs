@@ -3,6 +3,7 @@
 // remote vulnerabilities. Any `unsafe` here is now a compile error.
 #![forbid(unsafe_code)]
 
+use araxmesh::PeerDescriptor;
 use clap::Parser;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::net::SocketAddr;
@@ -314,6 +315,40 @@ impl PeerManager {
     fn new(local_priv: Vec<u8>, peers: Vec<Peer>) -> Self {
         Self { local_priv, peers }
     }
+
+    /// Reconcile the peer table with the set advertised by the coordinator:
+    /// add peers we don't have, update the endpoint/allowed_ip of ones we do
+    /// (keeping their live Noise sessions rather than tearing them down), and
+    /// drop peers the coordinator no longer lists. Malformed descriptors are
+    /// logged and skipped — a bad control-plane entry must not abort the sync.
+    // Exercised by tests now; wired into the coordinator poll task in a later step.
+    #[allow(dead_code)]
+    fn sync_peers(&mut self, descriptors: &[PeerDescriptor]) {
+        let mut wanted = Vec::new();
+        for d in descriptors {
+            match parse_peer_arg(&d.to_spec()) {
+                Ok(p) => wanted.push(p),
+                Err(e) => {
+                    tracing::warn!("Skipping invalid peer descriptor from coordinator: {}", e)
+                }
+            }
+        }
+
+        // Drop peers no longer present upstream.
+        self.peers
+            .retain(|p| wanted.iter().any(|w| w.pubkey == p.pubkey));
+
+        // Add new peers; update existing ones in place to preserve sessions.
+        for w in wanted {
+            if let Some(existing) = self.peers.iter_mut().find(|p| p.pubkey == w.pubkey) {
+                existing.endpoint = w.endpoint;
+                existing.allowed_ip = w.allowed_ip;
+            } else {
+                self.peers
+                    .push(Peer::new(w.pubkey, w.endpoint, w.allowed_ip));
+            }
+        }
+    }
 }
 
 fn parse_ipv4_header(packet: &[u8]) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
@@ -431,27 +466,7 @@ struct FileConfig {
     #[serde(default = "default_local_udp")]
     local_udp: String,
     #[serde(default)]
-    peer: Vec<FilePeer>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct FilePeer {
-    public_key: String,
-    endpoint: Option<String>,
-    allowed_ip: String,
-}
-
-impl FilePeer {
-    /// Render into the same `pubkey;[endpoint];allowed_ip` spec the CLI uses,
-    /// so config and `--peer` share one validation path (`parse_peer_arg`).
-    fn to_spec(&self) -> String {
-        format!(
-            "{};{};{}",
-            self.public_key,
-            self.endpoint.as_deref().unwrap_or(""),
-            self.allowed_ip
-        )
-    }
+    peer: Vec<PeerDescriptor>,
 }
 
 fn default_tun_name() -> String {
@@ -493,7 +508,7 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             tun_netmask: cfg.tun_netmask,
             local_udp,
             private_key_hex: cfg.private_key,
-            peer_specs: cfg.peer.iter().map(FilePeer::to_spec).collect(),
+            peer_specs: cfg.peer.iter().map(PeerDescriptor::to_spec).collect(),
         })
     } else {
         let tun_ip = args
@@ -1064,5 +1079,62 @@ mod tests {
         // No private_key -> deserialization must fail.
         let toml = "tun_ip = \"10.0.99.1\"\n";
         assert!(toml::from_str::<FileConfig>(toml).is_err());
+    }
+
+    // A PeerDescriptor whose pubkey is 32 copies of one byte.
+    fn desc(byte: u8, allowed_ip: &str, endpoint: Option<&str>) -> PeerDescriptor {
+        PeerDescriptor {
+            public_key: format!("{byte:02x}").repeat(32),
+            allowed_ip: allowed_ip.to_string(),
+            endpoint: endpoint.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sync_peers_adds_new_peers() {
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        pm.sync_peers(&[
+            desc(0xaa, "10.0.99.2", Some("1.2.3.4:50001")),
+            desc(0xbb, "10.0.99.3", None),
+        ]);
+        assert_eq!(pm.peers.len(), 2);
+        assert_eq!(pm.peers[0].pubkey, vec![0xaa; 32]);
+        assert_eq!(pm.peers[1].endpoint, None);
+    }
+
+    #[test]
+    fn sync_peers_updates_endpoint_without_recreating_peer() {
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        pm.sync_peers(&[desc(0xaa, "10.0.99.2", None)]);
+        let rx_before = pm.peers[0].last_rx;
+
+        pm.sync_peers(&[desc(0xaa, "10.0.99.2", Some("9.9.9.9:9"))]);
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(pm.peers[0].endpoint, Some("9.9.9.9:9".parse().unwrap()));
+        // Same Peer object (in-place update) => its session-tracking state
+        // (here last_rx) is untouched; a recreate would have reset it.
+        assert_eq!(pm.peers[0].last_rx, rx_before);
+    }
+
+    #[test]
+    fn sync_peers_drops_absent_peers() {
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        pm.sync_peers(&[desc(0xaa, "10.0.99.2", None), desc(0xbb, "10.0.99.3", None)]);
+        pm.sync_peers(&[desc(0xaa, "10.0.99.2", None)]);
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(pm.peers[0].pubkey, vec![0xaa; 32]);
+    }
+
+    #[test]
+    fn sync_peers_skips_invalid_descriptor() {
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        let bad = PeerDescriptor {
+            public_key: "zz".repeat(32), // not hex
+            allowed_ip: "10.0.99.9".to_string(),
+            endpoint: None,
+        };
+        pm.sync_peers(&[bad, desc(0xaa, "10.0.99.2", None)]);
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(pm.peers[0].pubkey, vec![0xaa; 32]);
     }
 }
