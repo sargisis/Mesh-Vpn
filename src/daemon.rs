@@ -8,12 +8,48 @@ use crate::types::PeerDescriptor;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tun_rs::DeviceBuilder;
 use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
 
+
+/// Exponential backoff for reconnect / retry loops: start small, double on each
+/// failure up to a cap, and `reset` after a success. Keeps a flapping coordinator
+/// or relay from being hammered while ensuring the daemon never gives up and dies.
+struct Backoff {
+    current: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    const INITIAL: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            current: Self::INITIAL,
+            max: Self::MAX,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current = Self::INITIAL;
+    }
+
+    /// Return the current delay, then double it (saturating at `max`) for next time.
+    fn advance(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+
+    /// Sleep for the current delay, then advance.
+    async fn wait(&mut self) {
+        tokio::time::sleep(self.advance()).await;
+    }
+}
 
 /// Sliding-window anti-replay filter (RFC 6479 / WireGuard style).
 ///
@@ -552,15 +588,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tracing::info!("Registering with coordinator at {}...", reg_url);
-        let reg_resp: RegisterResponse = http_client
-            .post(&reg_url)
-            .json(&reg_req)
-            .send()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Registration failed: {}", e)))?
-            .json()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid registration response: {}", e)))?;
+        // Retry forever with backoff: a coordinator that is down at startup must not
+        // kill the daemon — keep trying until it answers.
+        let reg_resp: RegisterResponse = {
+            let mut backoff = Backoff::new();
+            loop {
+                match http_client.post(&reg_url).json(&reg_req).send().await {
+                    Ok(resp) => match resp.json::<RegisterResponse>().await {
+                        Ok(parsed) => break parsed,
+                        Err(e) => {
+                            tracing::warn!("Invalid registration response: {}; retrying...", e)
+                        }
+                    },
+                    Err(e) => tracing::warn!(
+                        "Registration failed: {}; coordinator may be unreachable, retrying...",
+                        e
+                    ),
+                }
+                backoff.wait().await;
+            }
+        };
 
         tracing::info!("Successfully registered. Assigned IP: {}", reg_resp.assigned_ip);
         if let Some(ref obs) = reg_resp.observed_endpoint {
@@ -1068,11 +1115,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let relay_send_tx_clone = relay_send_tx.clone();
 
         tokio::spawn(async move {
+            let mut backoff = Backoff::new();
             loop {
                 tracing::info!("Connecting to relay server at {}...", relay_addr);
                 let client = RelayClient::new(relay_addr.clone(), local_pubkey);
                 match client.connect().await {
                     Ok((relay_client_tx, mut relay_client_rx, connection_handle)) => {
+                        // Connected: reset backoff so a later drop reconnects promptly.
+                        backoff.reset();
                         tracing::info!("Relay connection established");
 
                         let tx_forward = async {
@@ -1108,7 +1158,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                backoff.wait().await;
             }
         })
     } else {
@@ -1661,6 +1711,20 @@ mod tests {
         // Re-delivering any of them is a replay.
         assert!(receiver.decrypt_packet(&p1[1..]).is_none());
         assert!(receiver.decrypt_packet(&p2[1..]).is_none());
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_resets() {
+        let mut b = Backoff::new();
+        assert_eq!(b.advance(), Duration::from_secs(1));
+        assert_eq!(b.advance(), Duration::from_secs(2));
+        assert_eq!(b.advance(), Duration::from_secs(4));
+        assert_eq!(b.advance(), Duration::from_secs(8));
+        assert_eq!(b.advance(), Duration::from_secs(16));
+        assert_eq!(b.advance(), Duration::from_secs(30), "capped at MAX (32 -> 30)");
+        assert_eq!(b.advance(), Duration::from_secs(30), "stays capped");
+        b.reset();
+        assert_eq!(b.advance(), Duration::from_secs(1), "reset returns to INITIAL");
     }
 }
 
