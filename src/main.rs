@@ -1,3 +1,8 @@
+// Deny all unsafe code in this crate: a from-scratch VPN data plane parses
+// untrusted packets from the network, exactly where memory-safety bugs become
+// remote vulnerabilities. Any `unsafe` here is now a compile error.
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::net::SocketAddr;
