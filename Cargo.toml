@@ -12,4 +12,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 rand = "0.8"
 hex = "0.4"
+snow = "0.9"
+
 
