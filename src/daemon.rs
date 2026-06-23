@@ -2,6 +2,7 @@
 
 use crate::config::{Startup, parse_peer_arg, parse_startup};
 use crate::control::{PollRequest, PollResponse, RegisterRequest, RegisterResponse};
+use crate::nat::{self, PROBE_PACKET_TYPE};
 use crate::packet::parse_ipv4_header;
 use crate::types::PeerDescriptor;
 use snow::{Builder, HandshakeState, StatelessTransportState};
@@ -9,7 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tun_rs::DeviceBuilder;
+use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
 
 
 struct ActiveSession {
@@ -17,6 +20,12 @@ struct ActiveSession {
     tx_nonce: u64,
     established_at: Instant,
     tx_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+enum OutboundDest {
+    Udp(SocketAddr),
+    Relay([u8; 32]),
 }
 
 struct Peer {
@@ -32,6 +41,7 @@ struct Peer {
 
     last_rx: Instant,
     last_tx: Instant,
+    last_direct_rx: Instant,
 }
 
 impl Peer {
@@ -47,11 +57,21 @@ impl Peer {
             last_handshake_packet: None,
             last_rx: Instant::now(),
             last_tx: Instant::now(),
+            last_direct_rx: Instant::now(),
+        }
+    }
+
+    fn determine_dest(&self, has_relay: bool) -> Option<OutboundDest> {
+        if has_relay && (self.endpoint.is_none() || self.last_direct_rx.elapsed().as_secs() >= 10) {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&self.pubkey);
+            Some(OutboundDest::Relay(key))
+        } else {
+            self.endpoint.map(OutboundDest::Udp)
         }
     }
 
     fn initiate_handshake(&mut self, local_priv: &[u8]) -> Option<Vec<u8>> {
-        let _ = self.endpoint?;
 
         let mut builder = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
         builder = builder.local_private_key(local_priv);
@@ -321,9 +341,10 @@ impl PeerManager {
     /// (keeping their live Noise sessions rather than tearing them down), and
     /// drop peers the coordinator no longer lists. Malformed descriptors are
     /// logged and skipped — a bad control-plane entry must not abort the sync.
-    // Exercised by tests now; wired into the coordinator poll task in a later step.
+    ///
+    /// Returns the endpoints of newly added peers (for hole-punching).
     #[allow(dead_code)]
-    fn sync_peers(&mut self, descriptors: &[PeerDescriptor]) {
+    fn sync_peers(&mut self, descriptors: &[PeerDescriptor]) -> Vec<std::net::SocketAddr> {
         let mut wanted = Vec::new();
         for d in descriptors {
             match parse_peer_arg(&d.to_spec()) {
@@ -339,15 +360,23 @@ impl PeerManager {
             .retain(|p| wanted.iter().any(|w| w.pubkey == p.pubkey));
 
         // Add new peers; update existing ones in place to preserve sessions.
+        let mut new_endpoints = Vec::new();
         for w in wanted {
             if let Some(existing) = self.peers.iter_mut().find(|p| p.pubkey == w.pubkey) {
                 existing.endpoint = w.endpoint;
                 existing.allowed_ip = w.allowed_ip;
             } else {
-                self.peers
-                    .push(Peer::new(w.pubkey, w.endpoint, w.allowed_ip));
+                if let Some(ep) = w.endpoint {
+                    new_endpoints.push(ep);
+                    self.peers
+                        .push(Peer::new(w.pubkey, Some(ep), w.allowed_ip));
+                } else {
+                    self.peers
+                        .push(Peer::new(w.pubkey, None, w.allowed_ip));
+                }
             }
         }
+        new_endpoints
     }
 }
 
@@ -417,6 +446,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid registration response: {}", e)))?;
 
         tracing::info!("Successfully registered. Assigned IP: {}", reg_resp.assigned_ip);
+        if let Some(ref obs) = reg_resp.observed_endpoint {
+            tracing::info!("Observed external endpoint (STUN-like): {}", obs);
+        }
 
         let mut parsed_peers = Vec::new();
         for p_desc in reg_resp.peers {
@@ -482,12 +514,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let dev_tx = Arc::new(dev);
     let dev_rx = dev_tx.clone();
+    let dev_tx_relay = dev_tx.clone();
 
     let sock_tx = sock.clone();
     let sock_rx = sock.clone();
 
     let pm_tx = pm.clone();
     let pm_rx = pm.clone();
+
+    let (relay_send_tx, mut relay_send_rx) = mpsc::channel::<OutboundRelayPacket>(128);
+    let has_relay = settings.relay_addr.is_some();
+    let relay_tx_timer = if has_relay { Some(relay_send_tx.clone()) } else { None };
+    let relay_tx_tun = if has_relay { Some(relay_send_tx.clone()) } else { None };
 
     // Handshake retransmission, keepalive, key rotation timer
     let session_timer = pm.clone();
@@ -510,7 +548,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             hex::encode(&peer.pubkey)
                         );
                         if let Some(packet) = peer.initiate_handshake(&local_priv) {
-                            actions.push((packet, peer.endpoint));
+                            if let Some(dest) = peer.determine_dest(has_relay) {
+                                actions.push((packet, dest));
+                            }
                         }
                     }
 
@@ -528,19 +568,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if peer.active.is_some() && peer.last_tx.elapsed().as_secs() >= 10 {
                         tracing::debug!("Sending keepalive to peer {}", hex::encode(&peer.pubkey));
                         if let Some(packet) = peer.encrypt_packet(&[]) {
-                            actions.push((packet, peer.endpoint));
+                            if let Some(dest) = peer.determine_dest(has_relay) {
+                                actions.push((packet, dest));
+                            }
                         }
                     }
 
-                    // 4. Retransmit or initiate handshake if no active session and endpoint is known
-                    if peer.active.is_none() && peer.handshake.is_none() && peer.endpoint.is_some()
+                    // 4. Retransmit or initiate handshake if no active session
+                    if peer.active.is_none() && peer.handshake.is_none() && (peer.endpoint.is_some() || has_relay)
                     {
                         tracing::info!(
                             "No active session for peer {}. Initiating handshake...",
                             hex::encode(&peer.pubkey)
                         );
                         if let Some(packet) = peer.initiate_handshake(&local_priv) {
-                            actions.push((packet, peer.endpoint));
+                            if let Some(dest) = peer.determine_dest(has_relay) {
+                                actions.push((packet, dest));
+                            }
                         }
                     } else if let Some(attempt) = peer.last_handshake_attempt
                         && attempt.elapsed().as_secs() >= 2
@@ -551,23 +595,32 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         peer.last_handshake_attempt = Some(Instant::now());
                         if let Some(packet) = &peer.last_handshake_packet {
-                            actions.push((packet.clone(), peer.endpoint));
+                            if let Some(dest) = peer.determine_dest(has_relay) {
+                                actions.push((packet.clone(), dest));
+                            }
                         }
                     }
                 }
             }
 
-            for (packet, endpoint) in actions {
-                if let Some(addr) = endpoint
-                    && let Err(e) = sock_timer.send_to(&packet, addr).await
-                {
-                    tracing::error!("Failed to send timer packet to {}: {:?}", addr, e);
+            for (packet, dest) in actions {
+                match dest {
+                    OutboundDest::Udp(addr) => {
+                        if let Err(e) = sock_timer.send_to(&packet, addr).await {
+                            tracing::error!("Failed to send timer packet to {}: {:?}", addr, e);
+                        }
+                    }
+                    OutboundDest::Relay(dest_key) => {
+                        if let Some(ref tx) = relay_tx_timer {
+                            let _ = tx.send(OutboundRelayPacket { dest_key, payload: packet }).await;
+                        }
+                    }
                 }
             }
         }
     });
 
-    // Task 1: Read IP packets from TUN, route to peer, encrypt, send over UDP
+    // Task 1: Read IP packets from TUN, route to peer, encrypt, send over UDP or Relay
     let tun_to_udp_task = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         loop {
@@ -592,7 +645,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 manager.peers.iter_mut().find(|p| p.allowed_ip == dst_ip)
                             {
                                 if let Some(packet) = peer.encrypt_packet(packet_payload) {
-                                    action = Some((packet, peer.endpoint));
+                                    if let Some(dest) = peer.determine_dest(has_relay) {
+                                        action = Some((packet, dest));
+                                    }
                                 } else if peer.active.is_none()
                                     && peer.handshake.is_none()
                                     && let Some(hs_packet) = peer.initiate_handshake(&local_priv)
@@ -602,21 +657,32 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         hex::encode(&peer.pubkey),
                                         peer.allowed_ip
                                     );
-                                    action = Some((hs_packet, peer.endpoint));
+                                    if let Some(dest) = peer.determine_dest(has_relay) {
+                                        action = Some((hs_packet, dest));
+                                    }
                                 }
                             } else {
                                 tracing::debug!("No routed peer for dst IP: {}", dst_ip);
                             }
                         }
 
-                        if let Some((packet, Some(endpoint))) = action
-                            && let Err(e) = sock_tx.send_to(&packet, endpoint).await
-                        {
-                            tracing::error!(
-                                "Failed to send UDP packet to peer {}: {:?}",
-                                endpoint,
-                                e
-                            );
+                        if let Some((packet, dest)) = action {
+                            match dest {
+                                OutboundDest::Udp(endpoint) => {
+                                    if let Err(e) = sock_tx.send_to(&packet, endpoint).await {
+                                        tracing::error!(
+                                            "Failed to send UDP packet to peer {}: {:?}",
+                                            endpoint,
+                                            e
+                                        );
+                                    }
+                                }
+                                OutboundDest::Relay(dest_key) => {
+                                    if let Some(ref tx) = relay_tx_tun {
+                                        let _ = tx.send(OutboundRelayPacket { dest_key, payload: packet }).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -662,6 +728,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         manager.peers.iter_mut().find(|p| p.pubkey == remote_static)
                                     {
                                         peer.endpoint = Some(addr);
+                                        peer.last_direct_rx = Instant::now();
 
                                         let mut resp_msg = vec![0u8; 128];
                                         if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
@@ -717,6 +784,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 manager.peers.iter_mut().find(|p| p.endpoint == Some(addr))
                             {
                                 peer.handle_handshake_packet(&local_priv, packet_type, payload);
+                                peer.last_direct_rx = Instant::now();
                             } else {
                                 tracing::warn!(
                                     "Received handshake response from unknown endpoint: {}",
@@ -736,6 +804,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 && let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext)
                             {
                                 if src_ip == peer.allowed_ip {
+                                    peer.last_direct_rx = Instant::now();
                                     result = Some(plaintext);
                                 } else {
                                     tracing::warn!(
@@ -761,6 +830,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             addr
                                         );
                                         peer.endpoint = Some(addr);
+                                        peer.last_direct_rx = Instant::now();
                                         result = Some(plaintext);
                                         break;
                                     }
@@ -783,6 +853,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 addr
                             );
                         }
+                    } else if packet_type == PROBE_PACKET_TYPE {
+                        // Hole-punch probe: the sender is trying to open a
+                        // NAT mapping.  We log it and optionally update the
+                        // peer's endpoint if we can identify it.
+                        tracing::debug!(
+                            "Received hole-punch probe from {} (NAT mapping opened)",
+                            addr
+                        );
                     } else {
                         tracing::warn!(
                             "Received unknown packet type {} from {}",
@@ -803,6 +881,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let auth_key = settings.auth_key.clone().unwrap_or_default();
         let http_client = reqwest::Client::new();
         let pm_poll = pm.clone();
+        let sock_poll = sock.clone();
         let pubkey_hex = pubkey_hex.clone();
         let public_endpoint = public_endpoint.clone();
         tokio::spawn(async move {
@@ -823,8 +902,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         match resp.json::<PollResponse>().await {
                             Ok(poll_resp) => {
                                 tracing::debug!("Successfully polled coordinator. Reconciling {} peers.", poll_resp.peers.len());
-                                let mut manager = pm_poll.lock().unwrap();
-                                manager.sync_peers(&poll_resp.peers);
+                                let new_endpoints = {
+                                    let mut manager = pm_poll.lock().unwrap();
+                                    manager.sync_peers(&poll_resp.peers)
+                                };
+                                // Punch holes for any newly discovered peers.
+                                for ep in new_endpoints {
+                                    tracing::info!("New peer discovered at {}; initiating hole punch", ep);
+                                    let s = sock_poll.clone();
+                                    tokio::spawn(async move {
+                                        nat::punch_hole(&s, ep).await;
+                                    });
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to parse poll response: {:?}", e);
@@ -835,6 +924,60 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         tracing::warn!("Failed to poll coordinator: {:?}", e);
                     }
                 }
+            }
+        })
+    } else {
+        tokio::spawn(std::future::pending::<()>())
+    };
+
+    let relay_task = if let Some(ref relay_addr) = settings.relay_addr {
+        let relay_addr = relay_addr.clone();
+        let local_pubkey = pubkey_bytes;
+        let pm_relay = pm.clone();
+        let relay_send_tx_clone = relay_send_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tracing::info!("Connecting to relay server at {}...", relay_addr);
+                let client = RelayClient::new(relay_addr.clone(), local_pubkey);
+                match client.connect().await {
+                    Ok((relay_client_tx, mut relay_client_rx, connection_handle)) => {
+                        tracing::info!("Relay connection established");
+
+                        let tx_forward = async {
+                            while let Some(pkt) = relay_send_rx.recv().await {
+                                if relay_client_tx.send(pkt).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        let rx_forward = async {
+                            while let Some(pkt) = relay_client_rx.recv().await {
+                                if let Some(resp) = process_relayed_packet(&pm_relay, &dev_tx_relay, pkt).await {
+                                    let _ = relay_send_tx_clone.send(resp).await;
+                                }
+                            }
+                        };
+
+                        tokio::select! {
+                            _ = connection_handle => {
+                                tracing::warn!("Relay connection task finished");
+                            }
+                            _ = tx_forward => {
+                                tracing::warn!("Relay send forwarder finished");
+                            }
+                            _ = rx_forward => {
+                                tracing::warn!("Relay receive forwarder finished");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to connect to relay: {:?}", e);
+                    }
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         })
     } else {
@@ -854,9 +997,109 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         res = poll_task => {
             tracing::info!("Coordinator poll task finished: {:?}", res);
         }
+        res = relay_task => {
+            tracing::info!("Relay task finished: {:?}", res);
+        }
     }
 
     Ok(())
+}
+
+async fn process_relayed_packet(
+    pm: &Arc<std::sync::Mutex<PeerManager>>,
+    dev_tx: &Arc<tun_rs::AsyncDevice>,
+    pkt: RelayedPacket,
+) -> Option<OutboundRelayPacket> {
+    let packet_type = if pkt.payload.is_empty() {
+        return None;
+    } else {
+        pkt.payload[0]
+    };
+    let payload = &pkt.payload[1..];
+
+    if packet_type == 0x01 {
+        let mut manager = pm.lock().unwrap();
+        let local_priv = manager.local_priv.clone();
+
+        let mut builder = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+        builder = builder.local_private_key(&local_priv);
+
+        if let Ok(mut hs) = builder.build_responder() {
+            let mut read_buf = vec![0u8; 128];
+            if hs.read_message(payload, &mut read_buf).is_ok()
+                && let Some(remote_static_ref) = hs.get_remote_static()
+            {
+                let remote_static = remote_static_ref.to_vec();
+                if remote_static == pkt.from_key {
+                    if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == remote_static) {
+                        let mut resp_msg = vec![0u8; 128];
+                        if let Ok(len) = hs.write_message(&[], &mut resp_msg) {
+                            resp_msg.truncate(len);
+                            if let Ok(stateless_transport) = hs.into_stateless_transport_mode() {
+                                tracing::info!(
+                                    "Handshake complete for peer {} (initiator) via relay. Transitioning to Transport mode.",
+                                    hex::encode(remote_static)
+                                );
+
+                                if let Some(active) = peer.active.take() {
+                                    peer.previous = Some(active);
+                                }
+                                peer.active = Some(ActiveSession {
+                                    state: stateless_transport,
+                                    tx_nonce: 0,
+                                    established_at: Instant::now(),
+                                    tx_bytes: 0,
+                                });
+                                peer.last_rx = Instant::now();
+                                peer.last_tx = Instant::now();
+
+                                let mut resp_packet = Vec::with_capacity(1 + len);
+                                resp_packet.push(0x02);
+                                resp_packet.extend_from_slice(&resp_msg);
+
+                                return Some(OutboundRelayPacket {
+                                    dest_key: pkt.from_key,
+                                    payload: resp_packet,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if packet_type == 0x02 {
+        let mut manager = pm.lock().unwrap();
+        let local_priv = manager.local_priv.clone();
+        if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key) {
+            peer.handle_handshake_packet(&local_priv, packet_type, payload);
+        }
+    } else if packet_type == 0x03 {
+        let decrypted = {
+            let mut manager = pm.lock().unwrap();
+            let mut result = None;
+            if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key) {
+                if let Some(plaintext) = peer.decrypt_packet(payload) {
+                    if let Some((src_ip, _dst_ip)) = parse_ipv4_header(&plaintext) {
+                        if src_ip == peer.allowed_ip {
+                            result = Some(plaintext);
+                        } else {
+                            tracing::warn!("Cryptokey routing check failed for relayed packet");
+                        }
+                    }
+                }
+            }
+            result
+        };
+
+        if let Some(plaintext) = decrypted {
+            if !plaintext.is_empty() {
+                if let Err(e) = dev_tx.send(&plaintext).await {
+                    tracing::error!("Failed to write relayed packet to TUN: {:?}", e);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -933,13 +1176,13 @@ mod tests {
         let app = Router::new()
             .route("/register", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<RegisterRequest>| async move {
                 let mut reg = state.lock().unwrap();
-                let assigned_ip = reg.register(&req.public_key, req.endpoint, req.hostname).unwrap();
+                let (assigned_ip, observed_endpoint) = reg.register(&req.public_key, req.endpoint, req.hostname, None).unwrap();
                 let peers = reg.peers_for(&req.public_key);
-                Json(RegisterResponse { assigned_ip, peers })
+                Json(RegisterResponse { assigned_ip, peers, observed_endpoint })
             }))
             .route("/poll", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<PollRequest>| async move {
                 let mut reg = state.lock().unwrap();
-                reg.poll(&req.public_key, req.endpoint).unwrap();
+                reg.poll(&req.public_key, req.endpoint, None).unwrap();
                 let peers = reg.peers_for(&req.public_key);
                 Json(PollResponse { peers })
             }))
@@ -1014,6 +1257,143 @@ mod tests {
 
         assert_eq!(poll_resp_a.peers.len(), 1);
         assert_eq!(poll_resp_a.peers[0].public_key, "bb".repeat(32));
+    }
+
+    #[test]
+    fn test_determine_dest_no_relay() {
+        let peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), "10.0.99.2".parse().unwrap());
+
+        // If has_relay is false, and endpoint is Some, it should return Udp(endpoint).
+        let dest = peer.determine_dest(false);
+        assert!(matches!(dest, Some(OutboundDest::Udp(_))));
+        if let Some(OutboundDest::Udp(addr)) = dest {
+            assert_eq!(addr, "1.2.3.4:50002".parse::<SocketAddr>().unwrap());
+        }
+
+        // If has_relay is false, and endpoint is None, it should return None.
+        let peer_no_ep = Peer::new(vec![0xbb; 32], None, "10.0.99.2".parse().unwrap());
+        let dest_no_ep = peer_no_ep.determine_dest(false);
+        assert!(dest_no_ep.is_none());
+    }
+
+    #[test]
+    fn test_determine_dest_with_relay_fallback() {
+        let mut peer = Peer::new(vec![0xbb; 32], Some("1.2.3.4:50002".parse().unwrap()), "10.0.99.2".parse().unwrap());
+
+        // Initially last_direct_rx is Instant::now(), so last_direct_rx.elapsed() < 10.
+        // It should use direct UDP.
+        let dest = peer.determine_dest(true);
+        assert!(matches!(dest, Some(OutboundDest::Udp(_))));
+
+        // If last_direct_rx is 11 seconds ago, it should fallback to Relay.
+        peer.last_direct_rx = Instant::now() - std::time::Duration::from_secs(11);
+        let dest_fallback = peer.determine_dest(true);
+        assert!(matches!(dest_fallback, Some(OutboundDest::Relay(_))));
+        if let Some(OutboundDest::Relay(key)) = dest_fallback {
+            assert_eq!(key, [0xbb; 32]);
+        }
+
+        // If endpoint is None, it should always use Relay (if has_relay is true).
+        let peer_no_ep = Peer::new(vec![0xbb; 32], None, "10.0.99.2".parse().unwrap());
+        let dest_no_ep = peer_no_ep.determine_dest(true);
+        assert!(matches!(dest_no_ep, Some(OutboundDest::Relay(_))));
+    }
+
+    #[tokio::test]
+    async fn test_relay_fallback() {
+        use axum::{routing::post, Router, Json, extract::State};
+        use std::sync::{Arc, Mutex};
+        use crate::coordinator::Registry;
+        use crate::control::{RegisterRequest, RegisterResponse};
+        use crate::relay::{RelayClient, OutboundRelayPacket};
+
+        // 1. Mock Coordinator
+        let registry = Registry::new("10.0.99.0/24").unwrap();
+        let state = Arc::new(Mutex::new(registry));
+        let app = Router::new()
+            .route("/register", post(|State(state): State<Arc<Mutex<Registry>>>, Json(req): Json<RegisterRequest>| async move {
+                let mut reg = state.lock().unwrap();
+                let (assigned_ip, observed_endpoint) = reg.register(&req.public_key, req.endpoint, req.hostname, None).unwrap();
+                let peers = reg.peers_for(&req.public_key);
+                Json(RegisterResponse { assigned_ip, peers, observed_endpoint })
+            }))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // 2. Mock Relay TCP Server
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap().to_string();
+
+        let received_packets = Arc::new(Mutex::new(Vec::new()));
+        let received_packets_clone = received_packets.clone();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = relay_listener.accept().await.unwrap();
+            // Read 32-byte identity
+            let mut id = [0u8; 32];
+            use tokio::io::AsyncReadExt;
+            if stream.read_exact(&mut id).await.is_ok() {
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        break;
+                    }
+                    let frame_len = u32::from_be_bytes(len_buf) as usize;
+                    let mut frame = vec![0u8; frame_len];
+                    if stream.read_exact(&mut frame).await.is_err() {
+                        break;
+                    }
+                    let mut dest = [0u8; 32];
+                    dest.copy_from_slice(&frame[..32]);
+                    let payload = frame[32..].to_vec();
+                    received_packets_clone.lock().unwrap().push((dest, payload));
+                }
+            }
+        });
+
+        // 3. Setup peer manager with a peer that has no direct endpoint (inbound only)
+        // so it has to use the relay.
+        let local_priv = vec![0x01; 32];
+        let peer_pubkey = vec![0xbb; 32];
+
+        // We set last_direct_rx to 11s ago to simulate fallback.
+        let mut peer = Peer::new(peer_pubkey.clone(), None, "10.0.99.2".parse().unwrap());
+        peer.last_direct_rx = Instant::now() - std::time::Duration::from_secs(11);
+
+        let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, vec![peer])));
+
+        // 4. Connect relay client and run tx_forward
+        let local_pubkey_arr = [0xaa; 32];
+        let client = RelayClient::new(relay_addr, local_pubkey_arr);
+        let (relay_tx, _relay_rx, _connection_handle) = client.connect().await.unwrap();
+
+        // 5. Test determine_dest and send action
+        let action = {
+            let mut manager = pm.lock().unwrap();
+            let peer = &mut manager.peers[0];
+            let packet = vec![0x03, 0x01, 0x02]; // dummy encrypted data
+            let dest = peer.determine_dest(true).unwrap();
+            (packet, dest)
+        };
+
+        // Match dest and send it via the relay channel
+        match action.1 {
+            OutboundDest::Relay(dest_key) => {
+                relay_tx.send(OutboundRelayPacket { dest_key, payload: action.0 }).await.unwrap();
+            }
+            _ => panic!("Expected relay destination"),
+        }
+
+        // Give the background relay task a moment to process the frame
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let packets = received_packets.lock().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].0, [0xbb; 32]);
+        assert_eq!(packets[0].1, vec![0x03, 0x01, 0x02]);
     }
 }
 

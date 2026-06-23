@@ -64,6 +64,11 @@ pub struct NodeRecord {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub hostname: Option<String>,
+    /// The external `ip:port` as seen by the coordinator's TCP accept
+    /// (STUN-like reflexive address). Stored so it can be returned on
+    /// re-registration and compared with the self-reported endpoint.
+    #[serde(default)]
+    pub observed_endpoint: Option<String>,
 }
 
 /// The network registry: every node keyed by its public key, plus the
@@ -110,21 +115,23 @@ impl Registry {
 
     /// Register a node (or update an existing one). The overlay IP is allocated
     /// once and stays stable for that public key across re-registration.
-    /// Returns the assigned overlay IP.
+    /// Returns `(assigned_ip, observed_endpoint)`.
     pub fn register(
         &mut self,
         public_key: &str,
         endpoint: String,
         hostname: Option<String>,
-    ) -> Result<String, String> {
+        observed_endpoint: Option<String>,
+    ) -> Result<(String, Option<String>), String> {
         if let Some(existing) = self.nodes.get_mut(public_key) {
             existing.endpoint = Some(endpoint);
             if hostname.is_some() {
                 existing.hostname = hostname;
             }
+            existing.observed_endpoint = observed_endpoint.clone();
             let ip = existing.allowed_ip.clone();
             self.persist()?;
-            return Ok(ip);
+            return Ok((ip, observed_endpoint));
         }
 
         let used: std::collections::HashSet<Ipv4Addr> = self
@@ -144,19 +151,26 @@ impl Registry {
                 allowed_ip: ip.to_string(),
                 endpoint: Some(endpoint),
                 hostname,
+                observed_endpoint: observed_endpoint.clone(),
             },
         );
         self.persist()?;
-        Ok(ip.to_string())
+        Ok((ip.to_string(), observed_endpoint))
     }
 
     /// Refresh an already-registered node's endpoint. Errors if unknown.
-    pub fn poll(&mut self, public_key: &str, endpoint: String) -> Result<(), String> {
+    pub fn poll(
+        &mut self,
+        public_key: &str,
+        endpoint: String,
+        observed_endpoint: Option<String>,
+    ) -> Result<(), String> {
         let node = self
             .nodes
             .get_mut(public_key)
             .ok_or_else(|| format!("unknown node {public_key}"))?;
         node.endpoint = Some(endpoint);
+        node.observed_endpoint = observed_endpoint;
         self.persist()
     }
 
@@ -229,10 +243,10 @@ mod tests {
     #[test]
     fn register_assigns_sequential_ips() {
         let mut reg = Registry::new("10.0.99.0/24").unwrap();
-        let a = reg
-            .register("aa", "1.1.1.1:50000".into(), Some("a".into()))
+        let (a, _) = reg
+            .register("aa", "1.1.1.1:50000".into(), Some("a".into()), None)
             .unwrap();
-        let b = reg.register("bb", "2.2.2.2:50000".into(), None).unwrap();
+        let (b, _) = reg.register("bb", "2.2.2.2:50000".into(), None, None).unwrap();
         assert_eq!(a, "10.0.99.1");
         assert_eq!(b, "10.0.99.2");
     }
@@ -240,9 +254,9 @@ mod tests {
     #[test]
     fn register_is_stable_for_same_pubkey() {
         let mut reg = Registry::new("10.0.99.0/24").unwrap();
-        let first = reg.register("aa", "1.1.1.1:1".into(), None).unwrap();
+        let (first, _) = reg.register("aa", "1.1.1.1:1".into(), None, None).unwrap();
         // Re-register with a new endpoint: same IP, endpoint updated.
-        let again = reg.register("aa", "9.9.9.9:9".into(), None).unwrap();
+        let (again, _) = reg.register("aa", "9.9.9.9:9".into(), None, None).unwrap();
         assert_eq!(first, again);
         assert_eq!(reg.nodes.len(), 1);
         assert_eq!(reg.nodes["aa"].endpoint.as_deref(), Some("9.9.9.9:9"));
@@ -251,9 +265,9 @@ mod tests {
     #[test]
     fn peers_for_excludes_self() {
         let mut reg = Registry::new("10.0.99.0/24").unwrap();
-        reg.register("aa", "1.1.1.1:1".into(), None).unwrap();
-        reg.register("bb", "2.2.2.2:2".into(), None).unwrap();
-        reg.register("cc", "3.3.3.3:3".into(), None).unwrap();
+        reg.register("aa", "1.1.1.1:1".into(), None, None).unwrap();
+        reg.register("bb", "2.2.2.2:2".into(), None, None).unwrap();
+        reg.register("cc", "3.3.3.3:3".into(), None, None).unwrap();
 
         let peers = reg.peers_for("aa");
         assert_eq!(peers.len(), 2);
@@ -266,7 +280,7 @@ mod tests {
     #[test]
     fn poll_rejects_unknown_node() {
         let mut reg = Registry::new("10.0.99.0/24").unwrap();
-        assert!(reg.poll("ghost", "1.2.3.4:5".into()).is_err());
+        assert!(reg.poll("ghost", "1.2.3.4:5".into(), None).is_err());
     }
 
     #[test]
@@ -277,7 +291,7 @@ mod tests {
 
         {
             let mut reg = Registry::load_or_new("10.0.99.0/24", path.clone()).unwrap();
-            reg.register("aa", "1.1.1.1:1".into(), Some("host-a".into()))
+            reg.register("aa", "1.1.1.1:1".into(), Some("host-a".into()), None)
                 .unwrap();
         }
         // Reload from disk: the node and its assignment survive.

@@ -1,19 +1,35 @@
 # AraxMesh device config file.
 #
-# Run with:  sudo ./target/debug/araxmesh --config node.toml
-# Generate the keys with:  ./target/debug/araxmesh --gen-keys
+# Run with:    sudo ./target/debug/araxmesh --config node.toml
+# Generate keys:  ./target/debug/araxmesh --gen-keys
 #
 # This file fully describes one node: its own private key, TUN settings, and
-# the peer table. It replaces the repeated --peer / --private-key CLI flags
-# (those still work when --config is not given).
+# either a static peer table OR coordinator-based peer discovery.
 
 private_key = "<this node's 64-hex-char Noise private key>"
-tun_ip      = "10.0.99.1"
 
 # Optional — shown with their defaults:
 tun_name    = "arax0"
 tun_netmask = "255.255.255.0"
 local_udp   = "0.0.0.0:50001"
+
+# ─── Mode A: Coordinator-based peer discovery (recommended) ───────────
+#
+# When coordinator_url is set, the daemon registers itself with the
+# coordinator, receives an overlay IP, and polls every 10 s for peers.
+# No manual peer configuration is needed.
+
+# coordinator_url = "http://coordinator.example.com:51820"
+# auth_key        = "my-secret-token"
+# public_endpoint = "my-external-ip:50001"
+# hostname        = "my-laptop"
+
+# ─── Mode B: Static peer configuration ────────────────────────────────
+#
+# When coordinator_url is NOT set, peers must be listed here along
+# with a static tun_ip.
+
+tun_ip = "10.0.99.1"
 
 # One [[peer]] block per remote node.
 [[peer]]
