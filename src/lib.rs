@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod config;
+pub mod control;
+pub mod coordinator;
 pub mod daemon;
 mod packet;
 mod types;
