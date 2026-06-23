@@ -23,13 +23,13 @@ const PROBE_COUNT: u32 = 3;
 /// Delay between successive probe packets (ms).
 const PROBE_INTERVAL_MS: u64 = 200;
 
-/// Send a burst of empty probe packets (`0x04`) to `target` to punch through
-/// NAT.  Each probe is a single-byte packet `[0x04]`.
+/// Send a burst of empty probe packets with the configured `probe_byte` to `target`
+/// to punch through NAT. Each probe is a single-byte packet.
 ///
 /// This is fire-and-forget: errors on individual sends are logged but do not
 /// abort the burst.
-pub async fn punch_hole(sock: &Arc<UdpSocket>, target: SocketAddr) {
-    let probe = [PROBE_PACKET_TYPE];
+pub async fn punch_hole(sock: &Arc<UdpSocket>, target: SocketAddr, probe_byte: u8) {
+    let probe = [probe_byte];
     for i in 0..PROBE_COUNT {
         match sock.send_to(&probe, target).await {
             Ok(_) => {
@@ -69,7 +69,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = receiver.local_addr().unwrap();
 
-        punch_hole(&sender, target).await;
+        punch_hole(&sender, target, PROBE_PACKET_TYPE).await;
 
         // All three probes should have arrived.
         let mut buf = [0u8; 16];

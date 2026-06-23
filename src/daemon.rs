@@ -2,8 +2,9 @@
 
 use crate::config::{Startup, parse_peer_arg, parse_startup};
 use crate::control::{PollRequest, PollResponse, RegisterRequest, RegisterResponse};
-use crate::nat::{self, PROBE_PACKET_TYPE};
-use crate::packet::parse_ipv4_header;
+use crate::nat;
+use rand::{Rng, RngCore};
+use crate::packet::{parse_ipv4_header, parse_ipv4_total_length};
 use crate::types::PeerDescriptor;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 use std::net::SocketAddr;
@@ -13,6 +14,25 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tun_rs::DeviceBuilder;
 use crate::relay::{OutboundRelayPacket, RelayedPacket, RelayClient};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MagicConfig {
+    pub(crate) handshake_init: u8,
+    pub(crate) handshake_resp: u8,
+    pub(crate) data: u8,
+    pub(crate) probe: u8,
+}
+
+impl MagicConfig {
+    pub(crate) fn default() -> Self {
+        Self {
+            handshake_init: 0x01,
+            handshake_resp: 0x02,
+            data: 0x03,
+            probe: 0x04,
+        }
+    }
+}
 
 
 /// Exponential backoff for reconnect / retry loops: start small, double on each
@@ -164,6 +184,7 @@ struct Peer {
     last_rx: Instant,
     last_tx: Instant,
     last_direct_rx: Instant,
+    magic: MagicConfig,
 }
 
 impl Peer {
@@ -180,6 +201,7 @@ impl Peer {
             last_rx: Instant::now(),
             last_tx: Instant::now(),
             last_direct_rx: Instant::now(),
+            magic: MagicConfig::default(),
         }
     }
 
@@ -206,9 +228,14 @@ impl Peer {
                     Ok(len) => {
                         msg.truncate(len);
 
-                        let mut packet = Vec::with_capacity(1 + len);
-                        packet.push(0x01);
+                        use rand::RngCore;
+                        let mut packet = Vec::with_capacity(1 + len + 64);
+                        packet.push(self.magic.handshake_init);
                         packet.extend_from_slice(&msg);
+                        let pad_len = rand::thread_rng().gen_range(0..=64);
+                        let mut padding = vec![0u8; pad_len];
+                        rand::thread_rng().fill_bytes(&mut padding);
+                        packet.extend_from_slice(&padding);
 
                         self.handshake = Some(hs);
                         self.last_handshake_attempt = Some(Instant::now());
@@ -244,133 +271,138 @@ impl Peer {
         packet_type: u8,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
-        match packet_type {
-            0x01 => {
-                let mut builder =
-                    Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-                builder = builder.local_private_key(local_priv);
+        if packet_type == self.magic.handshake_init {
+            let payload = &payload[..96.min(payload.len())];
+            let mut builder =
+                Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+            builder = builder.local_private_key(local_priv);
 
-                match builder.build_responder() {
-                    Ok(mut hs) => {
-                        let mut read_buf = vec![0u8; 128];
-                        if let Err(e) = hs.read_message(payload, &mut read_buf) {
-                            tracing::error!("Failed to read handshake initiation: {:?}", e);
-                            return None;
-                        }
-
-                        if let Some(remote_static) = hs.get_remote_static() {
-                            if remote_static != self.pubkey {
-                                tracing::error!(
-                                    "Handshake authentication failed: remote static key does not match peer's key"
-                                );
-                                return None;
-                            }
-                        } else {
-                            tracing::error!(
-                                "Handshake authentication failed: remote static key not present"
-                            );
-                            return None;
-                        }
-
-                        let mut resp_msg = vec![0u8; 128];
-                        match hs.write_message(&[], &mut resp_msg) {
-                            Ok(len) => {
-                                resp_msg.truncate(len);
-
-                                match hs.into_stateless_transport_mode() {
-                                    Ok(stateless_transport) => {
-                                        tracing::info!(
-                                            "Handshake complete for peer {}. Transitioning to Transport mode.",
-                                            hex::encode(&self.pubkey)
-                                        );
-
-                                        if let Some(active) = self.active.take() {
-                                            self.previous = Some(active);
-                                        }
-
-                                        self.active = Some(ActiveSession {
-                                            state: stateless_transport,
-                                            tx_nonce: 0,
-                                            established_at: Instant::now(),
-                                            tx_bytes: 0,
-                                            replay: ReplayWindow::new(),
-                                        });
-                                        self.last_rx = Instant::now();
-                                        self.last_tx = Instant::now();
-
-                                        let mut resp_packet = Vec::with_capacity(1 + len);
-                                        resp_packet.push(0x02);
-                                        resp_packet.extend_from_slice(&resp_msg);
-                                        Some(resp_packet)
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to transition to stateless transport: {:?}",
-                                            e
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to write handshake response: {:?}", e);
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to build responder handshake: {:?}", e);
-                        None
-                    }
-                }
-            }
-            0x02 => {
-                if let Some(mut hs) = self.handshake.take() {
+            match builder.build_responder() {
+                Ok(mut hs) => {
                     let mut read_buf = vec![0u8; 128];
                     if let Err(e) = hs.read_message(payload, &mut read_buf) {
-                        tracing::error!("Failed to read handshake response: {:?}", e);
-                        self.handshake = Some(hs);
+                        tracing::error!("Failed to read handshake initiation: {:?}", e);
                         return None;
                     }
 
-                    match hs.into_stateless_transport_mode() {
-                        Ok(stateless_transport) => {
-                            tracing::info!(
-                                "Handshake complete for peer {}. Transitioning to Transport mode.",
-                                hex::encode(&self.pubkey)
+                    if let Some(remote_static) = hs.get_remote_static() {
+                        if remote_static != self.pubkey {
+                            tracing::error!(
+                                "Handshake authentication failed: remote static key does not match peer's key"
                             );
+                            return None;
+                        }
+                    } else {
+                        tracing::error!(
+                            "Handshake authentication failed: remote static key not present"
+                        );
+                        return None;
+                    }
 
-                            if let Some(active) = self.active.take() {
-                                self.previous = Some(active);
+                    let mut resp_msg = vec![0u8; 128];
+                    match hs.write_message(&[], &mut resp_msg) {
+                        Ok(len) => {
+                            resp_msg.truncate(len);
+
+                            match hs.into_stateless_transport_mode() {
+                                Ok(stateless_transport) => {
+                                    tracing::info!(
+                                        "Handshake complete for peer {}. Transitioning to Transport mode.",
+                                        hex::encode(&self.pubkey)
+                                    );
+
+                                    if let Some(active) = self.active.take() {
+                                        self.previous = Some(active);
+                                    }
+
+                                    self.active = Some(ActiveSession {
+                                        state: stateless_transport,
+                                        tx_nonce: 0,
+                                        established_at: Instant::now(),
+                                        tx_bytes: 0,
+                                        replay: ReplayWindow::new(),
+                                    });
+                                    self.last_rx = Instant::now();
+                                    self.last_tx = Instant::now();
+
+                                    use rand::RngCore;
+                                    let mut resp_packet = Vec::with_capacity(1 + len + 64);
+                                    resp_packet.push(self.magic.handshake_resp);
+                                    resp_packet.extend_from_slice(&resp_msg);
+                                    let pad_len = rand::thread_rng().gen_range(0..=64);
+                                    let mut padding = vec![0u8; pad_len];
+                                    rand::thread_rng().fill_bytes(&mut padding);
+                                    resp_packet.extend_from_slice(&padding);
+                                    Some(resp_packet)
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to transition to stateless transport: {:?}",
+                                        e
+                                    );
+                                    None
+                                }
                             }
-
-                            self.active = Some(ActiveSession {
-                                state: stateless_transport,
-                                tx_nonce: 0,
-                                established_at: Instant::now(),
-                                tx_bytes: 0,
-                                replay: ReplayWindow::new(),
-                            });
-
-                            self.handshake = None;
-                            self.last_handshake_attempt = None;
-                            self.last_handshake_packet = None;
-                            self.last_rx = Instant::now();
-                            self.last_tx = Instant::now();
                         }
                         Err(e) => {
-                            tracing::error!("Failed to transition to stateless transport: {:?}", e);
+                            tracing::error!("Failed to write handshake response: {:?}", e);
+                            None
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        "Received handshake response for peer {} but no handshake is in progress",
-                        hex::encode(&self.pubkey)
-                    );
                 }
-                None
+                Err(e) => {
+                    tracing::error!("Failed to build responder handshake: {:?}", e);
+                    None
+                }
             }
-            _ => None,
+        } else if packet_type == self.magic.handshake_resp {
+            let payload = &payload[..48.min(payload.len())];
+            if let Some(mut hs) = self.handshake.take() {
+                let mut read_buf = vec![0u8; 128];
+                if let Err(e) = hs.read_message(payload, &mut read_buf) {
+                    tracing::error!("Failed to read handshake response: {:?}", e);
+                    self.handshake = Some(hs);
+                    return None;
+                }
+
+                match hs.into_stateless_transport_mode() {
+                    Ok(stateless_transport) => {
+                        tracing::info!(
+                            "Handshake complete for peer {}. Transitioning to Transport mode.",
+                            hex::encode(&self.pubkey)
+                        );
+
+                        if let Some(active) = self.active.take() {
+                            self.previous = Some(active);
+                        }
+
+                        self.active = Some(ActiveSession {
+                            state: stateless_transport,
+                            tx_nonce: 0,
+                            established_at: Instant::now(),
+                            tx_bytes: 0,
+                            replay: ReplayWindow::new(),
+                        });
+
+                        self.handshake = None;
+                        self.last_handshake_attempt = None;
+                        self.last_handshake_packet = None;
+                        self.last_rx = Instant::now();
+                        self.last_tx = Instant::now();
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to transition to stateless transport: {:?}", e);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Received handshake response for peer {} but no handshake is in progress",
+                    hex::encode(&self.pubkey)
+                );
+            }
+            None
+        } else {
+            None
         }
     }
 
@@ -380,14 +412,22 @@ impl Peer {
         active.tx_nonce += 1;
         active.tx_bytes += payload.len() as u64;
 
-        let mut ciphertext = vec![0u8; payload.len() + 16];
-        match active.state.write_message(nonce, payload, &mut ciphertext) {
+        let mut padded_payload = payload.to_vec();
+        if !payload.is_empty() && parse_ipv4_total_length(payload).is_some() {
+            let pad_len = rand::thread_rng().gen_range(0..=128);
+            let mut padding = vec![0u8; pad_len];
+            rand::thread_rng().fill_bytes(&mut padding);
+            padded_payload.extend_from_slice(&padding);
+        }
+
+        let mut ciphertext = vec![0u8; padded_payload.len() + 16];
+        match active.state.write_message(nonce, &padded_payload, &mut ciphertext) {
             Ok(len) => {
                 ciphertext.truncate(len);
                 self.last_tx = Instant::now();
 
                 let mut packet = Vec::with_capacity(1 + 8 + ciphertext.len());
-                packet.push(0x03);
+                packet.push(self.magic.data);
                 packet.extend_from_slice(&nonce.to_be_bytes());
                 packet.extend_from_slice(&ciphertext);
                 Some(packet)
@@ -413,9 +453,6 @@ impl Peer {
         }
         let mut plaintext = vec![0u8; ciphertext.len() - 16];
 
-        // Authenticate FIRST, then enforce anti-replay. The window is advanced only
-        // on packets whose AEAD verifies, so a forged packet can never poison it and
-        // cause real traffic to be dropped as "old".
         if let Some(active) = self.active.as_mut()
             && let Ok(len) = active.state.read_message(nonce, ciphertext, &mut plaintext)
         {
@@ -424,6 +461,13 @@ impl Peer {
                 return None;
             }
             plaintext.truncate(len);
+            if !plaintext.is_empty() {
+                if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
+                    if total_len <= plaintext.len() {
+                        plaintext.truncate(total_len);
+                    }
+                }
+            }
             self.last_rx = Instant::now();
             return Some(plaintext);
         }
@@ -437,6 +481,13 @@ impl Peer {
                 return None;
             }
             plaintext.truncate(len);
+            if !plaintext.is_empty() {
+                if let Some(total_len) = parse_ipv4_total_length(&plaintext) {
+                    if total_len <= plaintext.len() {
+                        plaintext.truncate(total_len);
+                    }
+                }
+            }
             self.last_rx = Instant::now();
             return Some(plaintext);
         }
@@ -464,11 +515,15 @@ impl Peer {
 struct PeerManager {
     local_priv: Vec<u8>,
     peers: Vec<Peer>,
+    magic: MagicConfig,
 }
 
 impl PeerManager {
-    fn new(local_priv: Vec<u8>, peers: Vec<Peer>) -> Self {
-        Self { local_priv, peers }
+    fn new(local_priv: Vec<u8>, mut peers: Vec<Peer>, magic: MagicConfig) -> Self {
+        for peer in &mut peers {
+            peer.magic = magic;
+        }
+        Self { local_priv, peers, magic }
     }
 
     /// Reconcile the peer table with the set advertised by the coordinator:
@@ -503,11 +558,13 @@ impl PeerManager {
             } else {
                 if let Some(ep) = w.endpoint {
                     new_endpoints.push(ep);
-                    self.peers
-                        .push(Peer::new(w.pubkey, Some(ep), w.allowed_ips.clone()));
+                    let mut p = Peer::new(w.pubkey, Some(ep), w.allowed_ips.clone());
+                    p.magic = self.magic;
+                    self.peers.push(p);
                 } else {
-                    self.peers
-                        .push(Peer::new(w.pubkey, None, w.allowed_ips.clone()));
+                    let mut p = Peer::new(w.pubkey, None, w.allowed_ips.clone());
+                    p.magic = self.magic;
+                    self.peers.push(p);
                 }
             }
         }
@@ -667,7 +724,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, peers)));
+    let magic_config = MagicConfig {
+        handshake_init: settings.magic_handshake_init,
+        handshake_resp: settings.magic_handshake_resp,
+        data: settings.magic_data,
+        probe: settings.magic_probe,
+    };
+
+    let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, peers, magic_config)));
 
     let dev = DeviceBuilder::new()
         .name(&settings.tun_name)
@@ -878,13 +942,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
+                    let (magic_init, magic_resp, magic_data, magic_probe) = {
+                        let manager = pm_rx.lock().unwrap();
+                        (manager.magic.handshake_init, manager.magic.handshake_resp, manager.magic.data, manager.magic.probe)
+                    };
+
                     let packet_type = buf[0];
                     let payload = &buf[1..n];
 
-                    if packet_type == 0x01 {
+                    if packet_type == magic_init {
                         let resp = {
                             let mut manager = pm_rx.lock().unwrap();
                             let local_priv = manager.local_priv.clone();
+                            let magic = manager.magic;
                             let mut response_packet = None;
 
                             let mut builder =
@@ -893,7 +963,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                             if let Ok(mut hs) = builder.build_responder() {
                                 let mut read_buf = vec![0u8; 128];
-                                if hs.read_message(payload, &mut read_buf).is_ok()
+                                let initiation_payload = &payload[..96.min(payload.len())];
+                                if hs.read_message(initiation_payload, &mut read_buf).is_ok()
                                     && let Some(remote_static_ref) = hs.get_remote_static()
                                 {
                                     let remote_static = remote_static_ref.to_vec();
@@ -928,9 +999,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                 peer.last_rx = Instant::now();
                                                 peer.last_tx = Instant::now();
 
-                                                let mut resp_packet = Vec::with_capacity(1 + len);
-                                                resp_packet.push(0x02);
+                                                use rand::RngCore;
+                                                let mut resp_packet = Vec::with_capacity(1 + len + 64);
+                                                resp_packet.push(magic.handshake_resp);
                                                 resp_packet.extend_from_slice(&resp_msg);
+                                                let pad_len = rand::thread_rng().gen_range(0..=64);
+                                                let mut padding = vec![0u8; pad_len];
+                                                rand::thread_rng().fill_bytes(&mut padding);
+                                                resp_packet.extend_from_slice(&padding);
                                                 response_packet = Some(resp_packet);
                                             }
                                         }
@@ -950,7 +1026,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             tracing::error!("Failed to send handshake response: {:?}", e);
                         }
-                    } else if packet_type == 0x02 {
+                    } else if packet_type == magic_resp {
                         {
                             let mut manager = pm_rx.lock().unwrap();
                             let local_priv = manager.local_priv.clone();
@@ -966,7 +1042,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         }
-                    } else if packet_type == 0x03 {
+                    } else if packet_type == magic_data {
                         let decrypted = {
                             let mut manager = pm_rx.lock().unwrap();
                             let mut result = None;
@@ -1031,7 +1107,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 addr
                             );
                         }
-                    } else if packet_type == PROBE_PACKET_TYPE {
+                    } else if packet_type == magic_probe {
                         // Hole-punch probe: the sender is trying to open a
                         // NAT mapping.  We log it and optionally update the
                         // peer's endpoint if we can identify it.
@@ -1080,16 +1156,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         match resp.json::<PollResponse>().await {
                             Ok(poll_resp) => {
                                 tracing::debug!("Successfully polled coordinator. Reconciling {} peers.", poll_resp.peers.len());
-                                let new_endpoints = {
+                                let (new_endpoints, probe_byte) = {
                                     let mut manager = pm_poll.lock().unwrap();
-                                    manager.sync_peers(&poll_resp.peers)
+                                    (manager.sync_peers(&poll_resp.peers), manager.magic.probe)
                                 };
                                 // Punch holes for any newly discovered peers.
                                 for ep in new_endpoints {
                                     tracing::info!("New peer discovered at {}; initiating hole punch", ep);
                                     let s = sock_poll.clone();
                                     tokio::spawn(async move {
-                                        nat::punch_hole(&s, ep).await;
+                                        nat::punch_hole(&s, ep, probe_byte).await;
                                     });
                                 }
                             }
@@ -1191,14 +1267,16 @@ async fn process_relayed_packet(
     dev_tx: &Arc<tun_rs::AsyncDevice>,
     pkt: RelayedPacket,
 ) -> Option<OutboundRelayPacket> {
-    let packet_type = if pkt.payload.is_empty() {
-        return None;
-    } else {
-        pkt.payload[0]
+    let (packet_type, magic) = {
+        let manager = pm.lock().unwrap();
+        if pkt.payload.is_empty() {
+            return None;
+        }
+        (pkt.payload[0], manager.magic)
     };
     let payload = &pkt.payload[1..];
 
-    if packet_type == 0x01 {
+    if packet_type == magic.handshake_init {
         let mut manager = pm.lock().unwrap();
         let local_priv = manager.local_priv.clone();
 
@@ -1207,7 +1285,8 @@ async fn process_relayed_packet(
 
         if let Ok(mut hs) = builder.build_responder() {
             let mut read_buf = vec![0u8; 128];
-            if hs.read_message(payload, &mut read_buf).is_ok()
+            let initiation_payload = &payload[..96.min(payload.len())];
+            if hs.read_message(initiation_payload, &mut read_buf).is_ok()
                 && let Some(remote_static_ref) = hs.get_remote_static()
             {
                 let remote_static = remote_static_ref.to_vec();
@@ -1235,9 +1314,14 @@ async fn process_relayed_packet(
                                 peer.last_rx = Instant::now();
                                 peer.last_tx = Instant::now();
 
-                                let mut resp_packet = Vec::with_capacity(1 + len);
-                                resp_packet.push(0x02);
+                                use rand::RngCore;
+                                let mut resp_packet = Vec::with_capacity(1 + len + 64);
+                                resp_packet.push(magic.handshake_resp);
                                 resp_packet.extend_from_slice(&resp_msg);
+                                let pad_len = rand::thread_rng().gen_range(0..=64);
+                                let mut padding = vec![0u8; pad_len];
+                                rand::thread_rng().fill_bytes(&mut padding);
+                                resp_packet.extend_from_slice(&padding);
 
                                 return Some(OutboundRelayPacket {
                                     dest_key: pkt.from_key,
@@ -1249,13 +1333,13 @@ async fn process_relayed_packet(
                 }
             }
         }
-    } else if packet_type == 0x02 {
+    } else if packet_type == magic.handshake_resp {
         let mut manager = pm.lock().unwrap();
         let local_priv = manager.local_priv.clone();
         if let Some(peer) = manager.peers.iter_mut().find(|p| p.pubkey == pkt.from_key) {
             peer.handle_handshake_packet(&local_priv, packet_type, payload);
         }
-    } else if packet_type == 0x03 {
+    } else if packet_type == magic.data {
         let decrypted = {
             let mut manager = pm.lock().unwrap();
             let mut result = None;
@@ -1299,7 +1383,7 @@ mod tests {
 
     #[test]
     fn sync_peers_adds_new_peers() {
-        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![], MagicConfig::default());
         pm.sync_peers(&[
             desc(0xaa, "10.0.99.2", Some("1.2.3.4:50001")),
             desc(0xbb, "10.0.99.3", None),
@@ -1311,7 +1395,7 @@ mod tests {
 
     #[test]
     fn sync_peers_updates_endpoint_without_recreating_peer() {
-        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![], MagicConfig::default());
         pm.sync_peers(&[desc(0xaa, "10.0.99.2", None)]);
         let rx_before = pm.peers[0].last_rx;
 
@@ -1325,7 +1409,7 @@ mod tests {
 
     #[test]
     fn sync_peers_drops_absent_peers() {
-        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![], MagicConfig::default());
         pm.sync_peers(&[desc(0xaa, "10.0.99.2", None), desc(0xbb, "10.0.99.3", None)]);
         pm.sync_peers(&[desc(0xaa, "10.0.99.2", None)]);
         assert_eq!(pm.peers.len(), 1);
@@ -1334,7 +1418,7 @@ mod tests {
 
     #[test]
     fn sync_peers_skips_invalid_descriptor() {
-        let mut pm = PeerManager::new(vec![0u8; 32], vec![]);
+        let mut pm = PeerManager::new(vec![0u8; 32], vec![], MagicConfig::default());
         let bad = PeerDescriptor {
             public_key: "zz".repeat(32), // not hex
             allowed_ip: "10.0.99.9".to_string(),
@@ -1545,7 +1629,7 @@ mod tests {
         let mut peer = Peer::new(peer_pubkey.clone(), None, vec!["10.0.99.2".parse().unwrap()]);
         peer.last_direct_rx = Instant::now() - std::time::Duration::from_secs(11);
 
-        let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, vec![peer])));
+        let pm = Arc::new(std::sync::Mutex::new(PeerManager::new(local_priv, vec![peer], MagicConfig::default())));
 
         // 4. Connect relay client and run tx_forward
         let local_pubkey_arr = [0xaa; 32];
@@ -1589,7 +1673,7 @@ mod tests {
         let peer_b = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
         let peer_c = Peer::new(vec![0xcc; 32], None, vec!["0.0.0.0/0".parse().unwrap()]);
 
-        let pm = PeerManager::new(vec![0x00; 32], vec![peer_a, peer_b, peer_c]);
+        let pm = PeerManager::new(vec![0x00; 32], vec![peer_a, peer_b, peer_c], MagicConfig::default());
 
         // 1. Matches A (specific host wins over /24 and /0)
         let ip_a: Ipv4Addr = "10.0.99.5".parse().unwrap();
@@ -1609,7 +1693,7 @@ mod tests {
         // 4. If no exit node, and IP doesn't match subnets, returns None
         let peer_a_no_c = Peer::new(vec![0xaa; 32], None, vec!["10.0.99.5/32".parse().unwrap()]);
         let peer_b_no_c = Peer::new(vec![0xbb; 32], None, vec!["10.0.99.0/24".parse().unwrap()]);
-        let pm_no_c = PeerManager::new(vec![0x00; 32], vec![peer_a_no_c, peer_b_no_c]);
+        let pm_no_c = PeerManager::new(vec![0x00; 32], vec![peer_a_no_c, peer_b_no_c], MagicConfig::default());
         assert!(pm_no_c.find_best_peer_idx("8.8.8.8".parse().unwrap()).is_none());
     }
 
@@ -1725,6 +1809,94 @@ mod tests {
         assert_eq!(b.advance(), Duration::from_secs(30), "stays capped");
         b.reset();
         assert_eq!(b.advance(), Duration::from_secs(1), "reset returns to INITIAL");
+    }
+
+    #[test]
+    fn test_obfuscation_and_padding_transmission() {
+        let magic = MagicConfig {
+            handshake_init: 0x5e,
+            handshake_resp: 0xbc,
+            data: 0x8a,
+            probe: 0x22,
+        };
+
+        // 1. Handshake Simulation
+        let builder_sender = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+        let sender_keys = builder_sender.generate_keypair().unwrap();
+        let builder_receiver = Builder::new("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
+        let receiver_keys = builder_receiver.generate_keypair().unwrap();
+
+        let mut sender = Peer::new(receiver_keys.public.clone(), None, vec!["10.0.99.2/32".parse().unwrap()]);
+        sender.magic = magic;
+
+        let mut receiver = Peer::new(sender_keys.public.clone(), None, vec!["10.0.99.1/32".parse().unwrap()]);
+        receiver.magic = magic;
+
+        // Initiate handshake on sender
+        let handshake_init_packet = sender.initiate_handshake(&sender_keys.private).expect("initiate handshake");
+        assert_eq!(handshake_init_packet[0], magic.handshake_init);
+        // The packet length should be at least 1 (type) + 96 (Noise IK handshake msg) = 97 bytes, and potentially up to 97 + 64 = 161 bytes due to padding.
+        assert!(handshake_init_packet.len() >= 97);
+        assert!(handshake_init_packet.len() <= 161);
+
+        // Receive handshake initiation on receiver
+        let handshake_init_type = handshake_init_packet[0];
+        let handshake_init_payload = &handshake_init_packet[1..];
+        let handshake_resp_packet = receiver.handle_handshake_packet(
+            &receiver_keys.private,
+            handshake_init_type,
+            handshake_init_payload,
+        ).expect("handle handshake initiation and build response");
+
+        assert_eq!(handshake_resp_packet[0], magic.handshake_resp);
+        // Length should be at least 1 (type) + 48 (Noise IK response msg) = 49 bytes, and up to 49 + 64 = 113 bytes due to padding.
+        assert!(handshake_resp_packet.len() >= 49);
+        assert!(handshake_resp_packet.len() <= 113);
+
+        // Receive handshake response on sender
+        let handshake_resp_type = handshake_resp_packet[0];
+        let handshake_resp_payload = &handshake_resp_packet[1..];
+        let none_resp = sender.handle_handshake_packet(
+            &sender_keys.private,
+            handshake_resp_type,
+            handshake_resp_payload,
+        );
+        assert!(none_resp.is_none(), "responder handshake finishes handshakes and returns None");
+
+        // Both sender and receiver should now have active sessions in transport mode
+        assert!(sender.active.is_some());
+        assert!(receiver.active.is_some());
+
+        // 2. Data Transmission Simulation (with padding/obfuscation)
+        // A mock IPv4 packet (40 bytes total length: 20-byte header + 20-byte payload)
+        let mut mock_ipv4_packet = vec![0u8; 40];
+        mock_ipv4_packet[0] = 0x45; // Version 4, IHL 5
+        // Total length is 40 (0x0028)
+        mock_ipv4_packet[2] = 0x00;
+        mock_ipv4_packet[3] = 0x28;
+        // Src IP 10.0.99.1, Dst IP 10.0.99.2
+        mock_ipv4_packet[12..16].copy_from_slice(&[10, 0, 99, 1]);
+        mock_ipv4_packet[16..20].copy_from_slice(&[10, 0, 99, 2]);
+        // Fill the rest with dummy payload data
+        for i in 20..40 {
+            mock_ipv4_packet[i] = i as u8;
+        }
+
+        // Encrypt on sender
+        let encrypted_packet = sender.encrypt_packet(&mock_ipv4_packet).expect("encrypt packet");
+        assert_eq!(encrypted_packet[0], magic.data);
+        // Size should be: 1 (type) + 8 (nonce) + 40 (plaintext) + padding (0 to 128) + 16 (tag)
+        // Min size: 1 + 8 + 40 + 0 + 16 = 65
+        // Max size: 1 + 8 + 40 + 128 + 16 = 193
+        assert!(encrypted_packet.len() >= 65);
+        assert!(encrypted_packet.len() <= 193);
+
+        // Decrypt on receiver
+        let decrypted_payload = &encrypted_packet[1..]; // strip type byte only, keep 8-byte nonce
+        let decrypted_plaintext = receiver.decrypt_packet(decrypted_payload).expect("decrypt packet");
+        // Verify length is truncated exactly to original 40 bytes despite random padding
+        assert_eq!(decrypted_plaintext.len(), 40);
+        assert_eq!(decrypted_plaintext, mock_ipv4_packet);
     }
 }
 

@@ -17,6 +17,19 @@ pub(crate) fn parse_ipv4_header(packet: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     Some((src, dst))
 }
 
+/// Extracts the Total Length field from an IPv4 packet header.
+pub(crate) fn parse_ipv4_total_length(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    Some(total_len)
+}
+
 /// Represents an IPv4 CIDR subnet (e.g. `192.168.1.0/24` or `10.0.99.2/32`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ipv4Subnet {
@@ -89,6 +102,19 @@ mod tests {
         let (src, dst) = parse_ipv4_header(&pkt).expect("valid IPv4 header");
         assert_eq!(src, Ipv4Addr::new(10, 0, 99, 1));
         assert_eq!(dst, Ipv4Addr::new(10, 0, 99, 2));
+    }
+
+    #[test]
+    fn test_parse_ipv4_total_length() {
+        let mut pkt = make_ipv4(0x45, [10, 0, 99, 1], [10, 0, 99, 2]);
+        pkt[2] = 0x00;
+        pkt[3] = 0x28;
+        assert_eq!(parse_ipv4_total_length(&pkt).unwrap(), 40);
+
+        pkt[0] = 0x55;
+        assert!(parse_ipv4_total_length(&pkt).is_none());
+
+        assert!(parse_ipv4_total_length(&[0u8; 10]).is_none());
     }
 
     #[test]

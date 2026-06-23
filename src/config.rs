@@ -114,6 +114,22 @@ struct Args {
     /// TCP relay server address (e.g. 192.168.100.1:51821).
     #[arg(long)]
     relay_addr: Option<String>,
+
+    /// Magic byte for handshake initiation packet (DPI bypass)
+    #[arg(long)]
+    pub(crate) magic_handshake_init: Option<u8>,
+
+    /// Magic byte for handshake response packet (DPI bypass)
+    #[arg(long)]
+    pub(crate) magic_handshake_resp: Option<u8>,
+
+    /// Magic byte for encrypted transport data packet (DPI bypass)
+    #[arg(long)]
+    pub(crate) magic_data: Option<u8>,
+
+    /// Magic byte for hole-punch probe packet (DPI bypass)
+    #[arg(long)]
+    pub(crate) magic_probe: Option<u8>,
 }
 
 /// Device configuration loaded from a TOML file (Phase 3 device config file).
@@ -136,6 +152,10 @@ struct FileConfig {
     auth_key: Option<String>,
     hostname: Option<String>,
     public_endpoint: Option<String>,
+    magic_handshake_init: Option<u8>,
+    magic_handshake_resp: Option<u8>,
+    magic_data: Option<u8>,
+    magic_probe: Option<u8>,
 }
 
 fn default_tun_name() -> String {
@@ -162,6 +182,10 @@ pub(crate) struct DaemonSettings {
     pub(crate) auth_key: Option<String>,
     pub(crate) hostname: Option<String>,
     pub(crate) public_endpoint: Option<String>,
+    pub(crate) magic_handshake_init: u8,
+    pub(crate) magic_handshake_resp: u8,
+    pub(crate) magic_data: u8,
+    pub(crate) magic_probe: u8,
 }
 
 /// Resolve settings from `--config <file>` if given, otherwise from the CLI
@@ -200,6 +224,10 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             auth_key: cfg.auth_key,
             hostname: cfg.hostname,
             public_endpoint: cfg.public_endpoint,
+            magic_handshake_init: cfg.magic_handshake_init.unwrap_or(0x01),
+            magic_handshake_resp: cfg.magic_handshake_resp.unwrap_or(0x02),
+            magic_data: cfg.magic_data.unwrap_or(0x03),
+            magic_probe: cfg.magic_probe.unwrap_or(0x04),
         })
     } else {
         let coordinator_url = args.coordinator_url.clone();
@@ -237,6 +265,10 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
             auth_key: args.auth_key.clone(),
             hostname: args.hostname.clone(),
             public_endpoint: args.public_endpoint.clone(),
+            magic_handshake_init: args.magic_handshake_init.unwrap_or(0x01),
+            magic_handshake_resp: args.magic_handshake_resp.unwrap_or(0x02),
+            magic_data: args.magic_data.unwrap_or(0x03),
+            magic_probe: args.magic_probe.unwrap_or(0x04),
         })
     }
 }
