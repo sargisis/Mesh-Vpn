@@ -4,5 +4,5 @@
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    araxmesh::run().await
+    araxmesh::run().await.map_err(|e| e.into())
 }

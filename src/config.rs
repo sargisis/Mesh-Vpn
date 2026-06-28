@@ -3,6 +3,7 @@
 use crate::types::PeerDescriptor;
 use clap::Parser;
 use std::net::SocketAddr;
+use zeroize::Zeroize;
 
 pub(crate) struct ParsedPeer {
     pub(crate) pubkey: Vec<u8>,
@@ -10,46 +11,44 @@ pub(crate) struct ParsedPeer {
     pub(crate) allowed_ips: Vec<crate::packet::Ipv4Subnet>,
 }
 
-pub(crate) fn parse_peer_arg(s: &str) -> Result<ParsedPeer, Box<dyn std::error::Error>> {
+pub(crate) fn parse_peer_arg(s: &str) -> Result<ParsedPeer, crate::AraxError> {
     let parts: Vec<&str> = s.split(';').collect();
     if parts.len() != 3 {
-        return Err(format!(
+        return Err(crate::AraxError::Config(format!(
             "Invalid peer format: '{}'. Expected 'pubkey_hex;[endpoint];allowed_ip'",
             s
-        )
-        .into());
+        )));
     }
 
     let pubkey_hex = parts[0];
     let endpoint_str = parts[1];
     let allowed_ip_str = parts[2];
 
-    let pubkey = hex::decode(pubkey_hex)
-        .map_err(|e| format!("Invalid public key hex '{}': {}", pubkey_hex, e))?;
+    let pubkey = hex::decode(pubkey_hex).map_err(|e| {
+        crate::AraxError::Config(format!("Invalid public key hex '{}': {}", pubkey_hex, e))
+    })?;
     if pubkey.len() != 32 {
-        return Err(format!(
+        return Err(crate::AraxError::Config(format!(
             "Public key must be exactly 32 bytes (64 hex characters), got {} bytes",
             pubkey.len()
-        )
-        .into());
+        )));
     }
 
     let endpoint = if endpoint_str.is_empty() {
         None
     } else {
-        Some(
-            endpoint_str
-                .parse::<SocketAddr>()
-                .map_err(|e| format!("Invalid endpoint address '{}': {}", endpoint_str, e))?,
-        )
+        Some(endpoint_str.parse::<SocketAddr>().map_err(|e| {
+            crate::AraxError::Config(format!("Invalid endpoint address '{}': {}", endpoint_str, e))
+        })?)
     };
 
     let allowed_ips: Result<Vec<crate::packet::Ipv4Subnet>, _> = allowed_ip_str
         .split(',')
         .map(|part| part.trim().parse::<crate::packet::Ipv4Subnet>())
         .collect();
-    let allowed_ips =
-        allowed_ips.map_err(|e| format!("Invalid allowed IP(s) '{}': {}", allowed_ip_str, e))?;
+    let allowed_ips = allowed_ips.map_err(|e| {
+        crate::AraxError::Config(format!("Invalid allowed IP(s) '{}': {}", allowed_ip_str, e))
+    })?;
 
     Ok(ParsedPeer {
         pubkey,
@@ -169,10 +168,13 @@ fn default_local_udp() -> String {
 
 /// Effective daemon settings after merging the config file or CLI flags into
 /// one shape. Peers are kept as CLI-style specs and parsed downstream.
+#[derive(Zeroize)]
+#[zeroize(drop)]
 pub struct DaemonSettings {
     pub tun_name: String,
     pub tun_ip: Option<String>,
     pub tun_netmask: String,
+    #[zeroize(skip)]
     pub local_udp: SocketAddr,
     pub private_key_hex: String,
     pub peer_specs: Vec<String>,
@@ -181,24 +183,33 @@ pub struct DaemonSettings {
     pub auth_key: Option<String>,
     pub hostname: Option<String>,
     pub public_endpoint: Option<String>,
+    #[zeroize(skip)]
     pub magic_handshake_init: u8,
+    #[zeroize(skip)]
     pub magic_handshake_resp: u8,
+    #[zeroize(skip)]
     pub magic_data: u8,
+    #[zeroize(skip)]
     pub magic_probe: u8,
 }
 
 /// Resolve settings from `--config <file>` if given, otherwise from the CLI
 /// flags (preserving the existing flag-driven behaviour relied on by tests).
-fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::Error>> {
+fn resolve_settings(args: &Args) -> Result<DaemonSettings, crate::AraxError> {
     if let Some(path) = &args.config {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
-        let cfg: FileConfig = toml::from_str(&text)
-            .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
-        let local_udp = cfg
-            .local_udp
-            .parse::<SocketAddr>()
-            .map_err(|e| format!("Invalid local_udp '{}' in config: {}", cfg.local_udp, e))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            crate::AraxError::Config(format!("Failed to read config file {}: {}", path.display(), e))
+        })?;
+        let cfg: FileConfig = toml::from_str(&text).map_err(|e| {
+            crate::AraxError::Config(format!(
+                "Failed to parse config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let local_udp = cfg.local_udp.parse::<SocketAddr>().map_err(|e| {
+            crate::AraxError::Config(format!("Invalid local_udp '{}' in config: {}", cfg.local_udp, e))
+        })?;
 
         let relay_addr = cfg.relay_addr.or_else(|| {
             cfg.coordinator_url.as_ref().and_then(|url_str| {
@@ -232,14 +243,18 @@ fn resolve_settings(args: &Args) -> Result<DaemonSettings, Box<dyn std::error::E
         let coordinator_url = args.coordinator_url.clone();
         let tun_ip = if coordinator_url.is_none() {
             Some(args.tun_ip.clone().ok_or_else(|| {
-                "Missing required argument: --tun-ip (or use --config or --coordinator-url)"
-                    .to_string()
+                crate::AraxError::Config(
+                    "Missing required argument: --tun-ip (or use --config or --coordinator-url)"
+                        .to_string(),
+                )
             })?)
         } else {
             args.tun_ip.clone()
         };
         let private_key_hex = args.private_key.clone().ok_or_else(|| {
-            "Missing required argument: --private-key (or use --config)".to_string()
+            crate::AraxError::Config(
+                "Missing required argument: --private-key (or use --config)".to_string(),
+            )
         })?;
 
         let relay_addr = args.relay_addr.clone().or_else(|| {
@@ -280,7 +295,7 @@ pub(crate) enum Startup {
 }
 
 /// Parse argv and resolve into a Startup decision (keeps Args private here).
-pub(crate) fn parse_startup() -> Result<Startup, Box<dyn std::error::Error>> {
+pub(crate) fn parse_startup() -> Result<Startup, crate::AraxError> {
     let args = Args::parse();
     if args.gen_keys {
         Ok(Startup::GenKeys)

@@ -77,6 +77,7 @@ pub struct Registry {
     allocator: IpAllocator,
     nodes: HashMap<String, NodeRecord>,
     path: Option<PathBuf>,
+    whitelist: Option<std::collections::HashSet<String>>,
 }
 
 impl Registry {
@@ -86,6 +87,7 @@ impl Registry {
             allocator: IpAllocator::new(cidr)?,
             nodes: HashMap::new(),
             path: None,
+            whitelist: None,
         })
     }
 
@@ -116,6 +118,10 @@ impl Registry {
     /// Register a node (or update an existing one). The overlay IP is allocated
     /// once and stays stable for that public key across re-registration.
     /// Returns `(assigned_ip, observed_endpoint)`.
+    pub fn set_whitelist(&mut self, keys: Vec<String>) {
+        self.whitelist = Some(keys.into_iter().collect());
+    }
+
     pub fn register(
         &mut self,
         public_key: &str,
@@ -123,6 +129,12 @@ impl Registry {
         hostname: Option<String>,
         observed_endpoint: Option<String>,
     ) -> Result<(String, Option<String>), String> {
+        if let Some(whitelist) = &self.whitelist {
+            if !whitelist.contains(public_key) {
+                return Err(format!("node {public_key} is not whitelisted"));
+            }
+        }
+
         if let Some(existing) = self.nodes.get_mut(public_key) {
             existing.endpoint = Some(endpoint);
             if hostname.is_some() {

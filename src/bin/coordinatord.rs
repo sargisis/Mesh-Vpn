@@ -19,8 +19,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -52,12 +53,17 @@ struct Args {
     /// Set to 0 to disable the relay.
     #[arg(long, default_value = "51821")]
     relay_port: u16,
+
+    /// Optional comma-separated list of allowed public keys (hex).
+    #[arg(long)]
+    whitelist: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     registry: Arc<Mutex<Registry>>,
     auth_key: Arc<String>,
+    rate_limits: Arc<Mutex<HashMap<IpAddr, Instant>>>,
 }
 
 /// Relay routing table: maps a 32-byte Noise public key to a channel that
@@ -69,14 +75,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let registry = match &args.state_file {
-        Some(path) => Registry::load_or_new(&args.cidr, path.clone())?,
-        None => Registry::new(&args.cidr)?,
+    let mut registry = match &args.state_file {
+        Some(path) => Registry::load_or_new(&args.cidr, path.clone()).map_err(araxmesh::AraxError::Coordinator)?,
+        None => Registry::new(&args.cidr).map_err(araxmesh::AraxError::Coordinator)?,
     };
+
+    if let Some(wl) = &args.whitelist {
+        let keys: Vec<String> = wl.split(',').map(|s| s.trim().to_string()).collect();
+        registry.set_whitelist(keys);
+    }
 
     let state = AppState {
         registry: Arc::new(Mutex::new(registry)),
         auth_key: Arc::new(args.auth_key),
+        rate_limits: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -232,11 +244,25 @@ async fn register(
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
+    {
+        let mut limits = state.rate_limits.lock().unwrap();
+        let ip = client_addr.ip();
+        if let Some(last_reg) = limits.get(&ip) {
+            if last_reg.elapsed() < Duration::from_secs(5) {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Rate limit exceeded. Wait 5 seconds.".to_string(),
+                ));
+            }
+        }
+        limits.insert(ip, Instant::now());
+    }
+
     check_auth(&state, &req.auth_key)?;
     let observed = client_addr.to_string();
     let mut reg = state.registry.lock().unwrap();
     let (assigned_ip, observed_endpoint) = reg
-        .register(&req.public_key, req.endpoint, req.hostname, Some(observed))
+        .register(&req.public_key, req.endpoint.clone(), req.hostname.clone(), Some(observed))
         .map_err(|e| (StatusCode::CONFLICT, e))?;
     let peers = reg.peers_for(&req.public_key);
     tracing::info!(
@@ -260,7 +286,7 @@ async fn poll(
     check_auth(&state, &req.auth_key)?;
     let observed = client_addr.to_string();
     let mut reg = state.registry.lock().unwrap();
-    reg.poll(&req.public_key, req.endpoint, Some(observed))
+    reg.poll(&req.public_key, req.endpoint.clone(), Some(observed))
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     let peers = reg.peers_for(&req.public_key);
     Ok(Json(PollResponse { peers }))
