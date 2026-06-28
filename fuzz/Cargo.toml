@@ -1,0 +1,32 @@
+[package]
+name = "araxmesh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.araxmesh]
+path = ".."
+
+# Keep the fuzz crate out of the parent's dependency/build graph.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_ipv4_header"
+path = "fuzz_targets/parse_ipv4_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipv4_subnet_parse"
+path = "fuzz_targets/ipv4_subnet_parse.rs"
+test = false
+doc = false
+bench = false

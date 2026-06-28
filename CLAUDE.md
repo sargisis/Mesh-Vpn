@@ -39,7 +39,7 @@ sudo ./target/debug/araxmesh \
 
 ## Architecture
 
-Everything currently lives in `src/main.rs`. The daemon is a single Tokio process running three concurrent tasks coordinated through one `Arc<Mutex<PeerManager>>`. `tokio::select!` exits the process when any task finishes.
+The code is split into a small library (`src/lib.rs`) plus a thin binary (`src/main.rs`) that just calls `araxmesh::run()`. Library modules: `daemon` (peer/session state — `Peer`, `ActiveSession`, `PeerManager` — and the runtime loop, including `run()`), `config` (CLI `Args`, TOML `FileConfig`, `resolve_settings`, `parse_peer_arg`), `packet` (`parse_ipv4_header`), and `types` (`PeerDescriptor`, shared with the future coordinator). The daemon is a single Tokio process running three concurrent tasks coordinated through one `Arc<Mutex<PeerManager>>`. `tokio::select!` exits the process when any task finishes.
 
 The three tasks:
 1. **tun_to_udp** — reads IP packets from the TUN device, looks up the peer whose `allowed_ip` matches the packet's destination IP (cryptokey routing), encrypts, sends over UDP. If no session exists, it kicks off a handshake.
@@ -72,3 +72,13 @@ Overhead is 9 bytes (1 type + 8 nonce), which is why the TUN MTU is set to `1411
 
 - Errors in the packet hot paths are logged via `tracing` and the packet is dropped (return `None`) rather than propagated — the daemon should never crash on a malformed datagram. Only startup/config errors bubble up through `main`'s `Result`.
 - Pubkeys in logs are hex-encoded via `hex::encode`.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

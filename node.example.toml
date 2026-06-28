@@ -1,0 +1,45 @@
+# AraxMesh device config file.
+#
+# Run with:    sudo ./target/debug/araxmesh --config node.toml
+# Generate keys:  ./target/debug/araxmesh --gen-keys
+#
+# This file fully describes one node: its own private key, TUN settings, and
+# either a static peer table OR coordinator-based peer discovery.
+
+private_key = "<this node's 64-hex-char Noise private key>"
+
+# Optional — shown with their defaults:
+tun_name    = "arax0"
+tun_netmask = "255.255.255.0"
+local_udp   = "0.0.0.0:50001"
+
+# ─── Mode A: Coordinator-based peer discovery (recommended) ───────────
+#
+# When coordinator_url is set, the daemon registers itself with the
+# coordinator, receives an overlay IP, and polls every 10 s for peers.
+# No manual peer configuration is needed.
+
+# coordinator_url = "http://coordinator.example.com:51820"
+# auth_key        = "my-secret-token"
+# public_endpoint = "my-external-ip:50001"
+# hostname        = "my-laptop"
+
+# ─── Mode B: Static peer configuration ────────────────────────────────
+#
+# When coordinator_url is NOT set, peers must be listed here along
+# with a static tun_ip.
+
+tun_ip = "10.0.99.1"
+
+# One [[peer]] block per remote node.
+[[peer]]
+public_key = "<peer's 64-hex-char Noise public key>"
+endpoint   = "192.168.1.5:50002"   # the peer's reachable UDP address
+# allowed_ip can be a single host IP, a CIDR range, or a comma-separated list.
+# For example, to route peer traffic, a home subnet, and make it an exit node:
+allowed_ip = "10.0.99.2,192.168.1.0/24,0.0.0.0/0"
+
+[[peer]]
+public_key = "<another peer's public key>"
+# endpoint omitted: this peer only ever connects inbound (we never dial it).
+allowed_ip = "10.0.99.3/32"
